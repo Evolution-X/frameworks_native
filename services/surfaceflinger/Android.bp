@@ -38,6 +38,8 @@ cc_defaults {
         "-Wthread-safety",
         "-Wunreachable-code",
         "-Wunused",
+        "-O3",
+        "-g0"
     ],
 }
 
