@@ -61,6 +61,19 @@
 
 #include <com_android_graphics_libgui_flags.h>
 
+#if defined(MTK_GED_KPI) && defined(NO_BINDER)
+#undef MTK_GED_KPI
+#endif
+
+#ifdef MTK_GED_KPI
+#include <android-base/file.h>
+#include <android-base/stringprintf.h>
+#include <binder/IPCThreadState.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
 namespace android {
 
 using namespace com::android::graphics::libgui;
@@ -105,6 +118,101 @@ bool isInterceptorRegistrationOp(int op) {
 }
 
 } // namespace
+
+#ifdef MTK_GED_KPI
+namespace {
+
+struct GED_BRIDGE_PACKAGE {
+    unsigned int ui32FunctionID;
+    int i32Size;
+    void* pvParamIn;
+    int i32InBufferSize;
+    void* pvParamOut;
+    int i32OutBufferSize;
+};
+
+struct GED_BRIDGE_IN_GPU_TIMESTAMP {
+    int pid;
+    uint64_t ullWnd;
+    int32_t i32FrameID;
+    int fence_fd;
+    int QedBuffer_length;
+    int isSF;
+};
+
+struct GED_BRIDGE_OUT_GPU_TIMESTAMP {
+    int eError;
+    int is_ged_kpi_enabled;
+};
+
+constexpr char GED_MAGIC = 'g';
+constexpr int GED_BRIDGE_COMMAND_GPU_TIMESTAMP = 103;
+#define GED_BRIDGE_IO_GPU_TIMESTAMP \
+    _IOWR(GED_MAGIC, GED_BRIDGE_COMMAND_GPU_TIMESTAMP, GED_BRIDGE_PACKAGE)
+
+// QedBuffer_length values with special meaning to the GED KPI driver.
+constexpr int GED_QED_DEQUEUE = -2;
+constexpr int GED_QED_ACQUIRE = -1;
+
+int gedTimestampIoctl(int gedFd, GED_BRIDGE_IN_GPU_TIMESTAMP* in,
+                      GED_BRIDGE_OUT_GPU_TIMESTAMP* out) {
+    GED_BRIDGE_PACKAGE package{};
+    package.ui32FunctionID = static_cast<unsigned int>(GED_BRIDGE_IO_GPU_TIMESTAMP);
+    package.i32Size = sizeof(GED_BRIDGE_PACKAGE);
+    package.pvParamIn = in;
+    package.i32InBufferSize = sizeof(*in);
+    package.pvParamOut = out;
+    package.i32OutBufferSize = sizeof(*out);
+    return ioctl(gedFd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
+}
+
+// Opens /proc/ged once per process (thread-safe) and probes it. Returns -1 if unavailable.
+int getGedFd() {
+    static const int sGedFd = [] {
+        const int fd = open("/proc/ged", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            ALOGI("GED KPI: /proc/ged not available (errno=%d)", errno);
+            return -1;
+        }
+        GED_BRIDGE_IN_GPU_TIMESTAMP in{};
+        GED_BRIDGE_OUT_GPU_TIMESTAMP out{};
+        [[maybe_unused]] const int ret = gedTimestampIoctl(fd, &in, &out);
+        ALOGI("GED KPI: probe ioctl returned %d eError=%d is_ged_kpi_enabled=%d", ret,
+              out.eError, out.is_ged_kpi_enabled);
+        if (out.is_ged_kpi_enabled != 1) {
+            // Kept open on purpose (same as the original patch): DVFS still benefits from the
+            // timestamps even when the driver reports KPI as disabled on the first call.
+            ALOGW("GED KPI: driver reports is_ged_kpi_enabled != 1");
+        }
+        return fd;
+    }();
+    return sGedFd;
+}
+
+void gedNotifyTimestamp(int gedFd, int32_t pid, uint64_t wnd, bool isSF,
+                        const sp<GraphicBuffer>& buffer, int fenceFd, int qedBufferLength) {
+    if (buffer == nullptr) {
+        return;
+    }
+    GED_BRIDGE_IN_GPU_TIMESTAMP in{};
+    in.pid = pid;
+    in.ullWnd = wnd;
+    in.i32FrameID = static_cast<int32_t>(reinterpret_cast<intptr_t>(buffer->handle) & 0x3fffffff);
+    in.fence_fd = fenceFd;
+    in.QedBuffer_length = qedBufferLength;
+    in.isSF = isSF ? 1 : 0;
+    GED_BRIDGE_OUT_GPU_TIMESTAMP out{};
+    [[maybe_unused]] const int ret = gedTimestampIoctl(gedFd, &in, &out);
+    ALOGV("GED KPI: timestamp ioctl ret=%d eError=%d frame=%d qed=%d", ret, out.eError,
+          in.i32FrameID, qedBufferLength);
+}
+
+int dupFenceFd(const sp<Fence>& fence) {
+    return (fence != nullptr && fence->isValid()) ? fence->dup() : -1;
+}
+
+} // namespace
+#endif // MTK_GED_KPI
 
 Surface::ProducerDeathListenerProxy::ProducerDeathListenerProxy(
         const wp<SurfaceListener>& surfaceListener)
@@ -191,6 +299,11 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
     } else {
         ALOGE("Failed to get surface config from BQ. Error: %d", status);
     }
+
+#ifdef MTK_GED_KPI
+    mGedPid = getpid();
+    (void)getGedFd();
+#endif
 }
 
 Surface::~Surface() {
@@ -836,6 +949,17 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
         }
     }
 
+#ifdef MTK_GED_KPI
+    if (const int gedFd = getGedFd(); gedFd >= 0 && mGedWndId != 0) {
+        const int gedFence = dupFenceFd(fence);
+        gedNotifyTimestamp(gedFd, mGedPid, mGedWndId, mGedIsSurfaceFlinger, gbuf, gedFence,
+                           GED_QED_DEQUEUE);
+        if (gedFence >= 0) {
+            close(gedFence);
+        }
+    }
+#endif
+
     if (fence->isValid()) {
         *fenceFd = fence->dup();
         if (*fenceFd == -1) {
@@ -1074,6 +1198,17 @@ int Surface::dequeueBuffers(std::vector<BatchBuffer>* buffers) {
         if (input.getTimestamps) {
              mFrameEventHistory->applyDelta(output.timestamps.value());
         }
+
+#ifdef MTK_GED_KPI
+        if (const int gedFd = getGedFd(); gedFd >= 0 && mGedWndId != 0) {
+            const int gedFence = dupFenceFd(output.fence);
+            gedNotifyTimestamp(gedFd, mGedPid, mGedWndId, mGedIsSurfaceFlinger, gbuf, gedFence,
+                               GED_QED_DEQUEUE);
+            if (gedFence >= 0) {
+                close(gedFence);
+            }
+        }
+#endif
 
         if (output.fence->isValid()) {
             buffers->at(batchIdx).fenceFd = output.fence->dup();
@@ -1427,6 +1562,11 @@ void Surface::applyGrallocMetadataLocked(
 
 void Surface::onBufferQueuedLocked(int slot, const sp<Fence>& fence,
                                    const IGraphicBufferProducer::QueueBufferOutput& output) {
+#ifdef MTK_GED_KPI
+    // Capture the buffer before requiresFreeOnReturn may clear the slot below.
+    const sp<GraphicBuffer> gedBuffer =
+            (slot >= 0 && slot < (int)mSlots.size()) ? mSlots[slot].buffer : nullptr;
+#endif
     mDequeuedSlots.erase(slot);
     if (mSlots[slot].requiresFreeOnReturn) {
         mSlots[slot].buffer = nullptr;
@@ -1470,6 +1610,21 @@ void Surface::onBufferQueuedLocked(int slot, const sp<Fence>& fence,
     }
 
     mQueueBufferCondition.broadcast();
+
+#ifdef MTK_GED_KPI
+    if (const int gedFd = getGedFd(); gedFd >= 0 && mGedWndId != 0 && gedBuffer != nullptr) {
+        const int gedFence = dupFenceFd(fence);
+        // queue
+        gedNotifyTimestamp(gedFd, mGedPid, mGedWndId, mGedIsSurfaceFlinger, gedBuffer, gedFence,
+                           static_cast<int>(output.numPendingBuffers));
+        // acquire
+        gedNotifyTimestamp(gedFd, mGedPid, mGedWndId, mGedIsSurfaceFlinger, gedBuffer, gedFence,
+                           GED_QED_ACQUIRE);
+        if (gedFence >= 0) {
+            close(gedFence);
+        }
+    }
+#endif
 
     if (CC_UNLIKELY(atrace_is_tag_enabled(ATRACE_TAG_GRAPHICS))) {
         static gui::FenceMonitor gpuCompletionThread("GPU completion");
@@ -2378,9 +2533,44 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
             std::scoped_lock _dl(mDebugMutex);
             mDebugName = mGraphicBufferProducer->getConsumerName();
             mGraphicBufferProducer->getUniqueId(&mId);
+#ifdef MTK_GED_KPI
+            mGedWndId = mId;
+#endif
         }
         SURF_LOGE_IF(idErr != NO_ERROR, "Unable to get ID from IGBP: %d", idErr);
         mIsConnected = true;
+
+#ifdef MTK_GED_KPI
+        // For GED KPI we report the producer owner's PID and whether it is surfaceflinger.
+        if (api == NATIVE_WINDOW_API_EGL && getGedFd() >= 0) {
+            IPCThreadState* ipc = IPCThreadState::selfOrNull();
+            const sp<IBinder> token = IInterface::asBinder(mGraphicBufferProducer);
+            if (token != nullptr && token->localBinder() != nullptr) {
+                mGedPid = getpid();
+            } else if (ipc != nullptr) {
+                mGedPid = ipc->getCallingPid();
+            } else {
+                mGedPid = getpid();
+            }
+
+            mGedIsSurfaceFlinger = false;
+            std::string cmdline;
+            if (base::ReadFileToString(base::StringPrintf("/proc/%d/cmdline", mGedPid),
+                                       &cmdline)) {
+                // argv[0] only (cmdline is NUL-separated), then basename.
+                cmdline = cmdline.c_str();
+                const size_t newline = cmdline.find('\n');
+                if (newline != std::string::npos) {
+                    cmdline.resize(newline);
+                }
+                const size_t slash = cmdline.rfind('/');
+                const std::string name =
+                        (slash == std::string::npos) ? cmdline : cmdline.substr(slash + 1);
+                mGedIsSurfaceFlinger = (name == "surfaceflinger");
+            }
+            ALOGV("GED KPI: connect pid=%d isSurfaceFlinger=%d", mGedPid, mGedIsSurfaceFlinger);
+        }
+#endif
     }
     if (!err && api == NATIVE_WINDOW_API_CPU) {
         mConnectedToCpu = true;
@@ -2429,6 +2619,11 @@ int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
     mMaxBufferCount = NUM_BUFFER_SLOTS;
     mLastReplacedFrameId = {};
     mAutoGenerationUpdate = true;
+#ifdef MTK_GED_KPI
+    mGedWndId = 0;
+    mGedIsSurfaceFlinger = false;
+    mGedPid = getpid();
+#endif
 
     if (api == NATIVE_WINDOW_API_CPU) {
         mConnectedToCpu = false;
