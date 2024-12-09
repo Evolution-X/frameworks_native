@@ -1172,13 +1172,6 @@ public:
                 [listener = mListener, slots = slots]() { listener->onBuffersDiscarded(slots); });
     }
 
-    void onBufferDetached(int slot, uint64_t bufferId) override {
-        AsyncProducerListenerWorker::getInstance().post(
-                [listener = mListener, slot = slot, bufferId = bufferId]() {
-                    listener->onBufferDetached(slot, bufferId);
-                });
-    }
-
     void onBufferAcquired(uint64_t bufferId, uint64_t frameNumber) override {
         AsyncProducerListenerWorker::getInstance().post(
                 [listener = mListener, bufferId = bufferId, frameNumber = frameNumber]() {
@@ -1192,13 +1185,6 @@ public:
                     listener->onBufferDropped(bufferId, frameNumber);
                 });
     };
-
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-    void onBufferAttached() override {
-        AsyncProducerListenerWorker::getInstance().post(
-                [listener = mListener]() { listener->onBufferAttached(); });
-    }
-#endif
 };
 
 // BufferReleaseReader is used to do blocking but interruptible reads from the buffer
