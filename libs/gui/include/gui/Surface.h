@@ -74,10 +74,6 @@ public:
 
     virtual void onBuffersDiscarded(const std::vector<sp<GraphicBuffer>>& buffers) = 0;
     virtual void onBufferDetached(uint64_t bufferId) = 0;
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-    virtual void onBufferAttached() {}
-    virtual bool needsAttachNotify() { return false; }
-#endif
 
     // Called if this Surface is connected to a remote implementation and it
     // dies or becomes unavailable.
@@ -621,11 +617,6 @@ protected:
 
         void setOnAcquiredCallback(ANativeWindow_OnAcquiredCallback onAcquiredCallback, void* data);
 
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-        virtual void onBufferAttached() override { mSurfaceListener->onBufferAttached(); }
-
-        virtual bool needsAttachNotify() override { return mSurfaceListener->needsAttachNotify(); }
-#endif
     private:
         wp<Surface> mParent;
         sp<SurfaceListener> mSurfaceListener;

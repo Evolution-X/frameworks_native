@@ -1502,9 +1502,6 @@ status_t BufferQueueProducer::connect(const sp<IProducerListener>& listener,
                 mCore->mBufferReleasedCbEnabled = listener->needsReleaseNotify();
                 mCore->mBufferAcquiredCbEnabled = listener->needsAcquiredNotify();
                 mCore->mBufferDroppedCbEnabled = listener->needsDroppedNotify();
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-                mCore->mBufferAttachedCbEnabled = listener->needsAttachNotify();
-#endif
             }
             break;
         default:

@@ -210,10 +210,6 @@ private:
     // callback is registered by the listener. When set to false,
     // mConnectedProducerListener will not trigger onBufferReleased() callback.
     bool mBufferReleasedCbEnabled;
-    // mBufferAttachedCbEnabled is used to indicate whether onBufferAttached()
-    // callback is registered by the listener. When set to false,
-    // mConnectedProducerListener will not trigger onBufferAttached() callback.
-    bool mBufferAttachedCbEnabled;
     //  mBufferAcquiredCbEnabled is used indicate whether onBufferAcquired()
     //  callback is registered by the listener. When set to false,
     //  mConnectedProducerListener will not trigger onBufferAcquired() callback.
