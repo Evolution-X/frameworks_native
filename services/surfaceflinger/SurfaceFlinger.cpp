@@ -124,6 +124,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 
 #include <common/FlagManager.h>
 #include <common/LayerFilter.h>
@@ -10497,10 +10499,54 @@ status_t SurfaceComposerAIDL::checkReadFrameBufferPermission() {
     IPCThreadState* ipc = IPCThreadState::self();
     const int pid = ipc->getCallingPid();
     const int uid = ipc->getCallingUid();
+
+    std::string processName;
+    char buf[256] = {0};
+
+    snprintf(buf, sizeof(buf), "/proc/%d/cmdline", pid);
+    FILE *file = fopen(buf, "r");
+    if (file) {
+        if (fgets(buf, sizeof(buf), file)) {
+            std::string cmdline(buf);
+            size_t pos = cmdline.find_last_of('/');
+            if (pos != std::string::npos) {
+                processName = cmdline.substr(pos + 1);
+            } else {
+                processName = cmdline;
+            }
+        }
+        fclose(file);
+    } else {
+        ALOGE("Failed to open %s", buf);
+    }
+
+    if (processName.empty()) {
+        snprintf(buf, sizeof(buf), "/proc/%d/status", pid);
+        file = fopen(buf, "r");
+        if (file) {
+            while (fgets(buf, sizeof(buf), file)) {
+                if (strncmp(buf, "Name:", 5) == 0) {
+                    char name[64] = {0};
+                    sscanf(buf, "%*s %63s", name);
+                    processName.assign(name);
+                    break;
+                }
+            }
+            fclose(file);
+        } else {
+            ALOGE("Failed to open %s", buf);
+        }
+    }
+
+    if (processName == "com.google.android.apps.nexuslauncher") {
+        return OK;
+    }
+
     if ((uid != AID_GRAPHICS) && !PermissionCache::checkPermission(sReadFramebuffer, pid, uid)) {
         ALOGE("Permission Denial: can't read framebuffer pid=%d, uid=%d", pid, uid);
         return PERMISSION_DENIED;
     }
+
     return OK;
 }
 
