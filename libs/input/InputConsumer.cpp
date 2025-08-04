@@ -431,7 +431,11 @@ status_t InputConsumer::consumeBatch(InputEventFactoryInterface* factory, nsecs_
         Batch& batch = mBatches[i];
         if (frameTime < 0) {
             result = consumeSamples(factory, batch, batch.samples.size(), outSeq, outEvent);
-            mBatches.erase(mBatches.begin() + i);
+            if (!mBatches.empty()) {  // Add safety check before erasing
+                mBatches.erase(mBatches.begin() + i);
+            } else {
+                ALOGW("Attempted to erase from empty batch vector in consumeBatch");
+            }
             return result;
         }
 
@@ -447,7 +451,11 @@ status_t InputConsumer::consumeBatch(InputEventFactoryInterface* factory, nsecs_
         result = consumeSamples(factory, batch, split + 1, outSeq, outEvent);
         const InputMessage* next;
         if (batch.samples.empty()) {
-            mBatches.erase(mBatches.begin() + i);
+            if (!mBatches.empty()) {
+                mBatches.erase(mBatches.begin() + i);
+            } else {
+                ALOGW("Attempted to erase from empty batch vector in consumeBatch");
+            }
             next = nullptr;
         } else {
             next = &batch.samples[0];
@@ -845,6 +853,7 @@ status_t InputConsumer::sendUnchainedFinishedSignal(uint32_t seq, bool handled) 
         // Trace the event processing timeline - event was just finished
         ATRACE_ASYNC_END(mProcessingTraceTag.c_str(), /*cookie=*/seq);
     }
+
     return result;
 }
 
