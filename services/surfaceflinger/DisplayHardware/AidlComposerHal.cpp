@@ -1826,7 +1826,7 @@ Error AidlComposer::getLuts(Display display, const std::vector<sp<GraphicBuffer>
     const auto status =
             mAidlComposerClient->getLuts(translate<int64_t>(display), aidlBuffers, luts);
     if (!status.isOk()) {
-        ALOGE("getLuts failed %s", status.getDescription().c_str());
+        ALOGD("getLuts failed %s", status.getDescription().c_str());
         return static_cast<Error>(status.getServiceSpecificError());
     }
 
