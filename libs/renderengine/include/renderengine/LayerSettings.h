@@ -196,6 +196,9 @@ struct LayerSettings {
         ftl_last = Behind,
     };
     SampleTarget postProcessTarget;
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+    bool enableDither = false;
+#endif
 };
 
 // Keep in sync with custom comparison function in
