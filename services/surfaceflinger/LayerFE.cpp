@@ -194,6 +194,9 @@ std::optional<compositionengine::LayerFE::LayerSettings> LayerFE::prepareClientC
     // Record the name of the layer for debugging further down the stack.
     layerSettings.name = mSnapshot->name;
     layerSettings.luts = mSnapshot->luts ? mSnapshot->luts : targetSettings.luts;
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+    layerSettings.enableDither = mDither.enabled;
+#endif
 
     layerSettings.renderCommandBuffer = mSnapshot->renderCommandBuffer;
     layerSettings.renderResourceCache = mSnapshot->renderResourceCache;
