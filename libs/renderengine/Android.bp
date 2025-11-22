@@ -30,7 +30,10 @@ cc_defaults {
     cflags: [
         "-DGL_GLEXT_PROTOTYPES",
         "-DEGL_EGLEXT_PROTOTYPES",
-    ],
+    ] + select(soong_config_variable("surfaceflinger", "has_mtk_udfps"), {
+        true: ["-DMTK_IN_DISPLAY_FINGERPRINT"],
+        default: [],
+    }),
     shared_libs: [
         "libbase",
         "libcrypto",
@@ -119,7 +122,10 @@ filegroup {
         "skia/filters/MouriMap.cpp",
         "skia/filters/RuntimeEffectManager.cpp",
         "skia/filters/StretchShaderFactory.cpp",
-    ],
+    ] + select(soong_config_variable("surfaceflinger", "has_mtk_udfps"), {
+        true: ["mediatek/SkiaDitherEffect.cpp"],
+        default: [],
+    }),
 }
 
 // Used to consolidate and simplify pulling Skia & Skia deps into targets that depend on

@@ -43,12 +43,19 @@ cc_defaults {
             "-DFRAME_RATE_CATEGORY_HIGH=" + value,
         ],
         default: [],
+
     }) + select(soong_config_variable("surfaceflinger", "frame_rate_category_min"), {
         any @ value: [
             "-DFRAME_RATE_CATEGORY_MIN=" + value,
         ],
         default: [],
-    }),
+    }) + select(soong_config_variable("surfaceflinger", "has_mtk_udfps"), {
+        true: ["-DMTK_IN_DISPLAY_FINGERPRINT"],
+        default: [],
+    }) + select(soong_config_variable("surfaceflinger", "mtk_dim_layer"), {
+        any @ mtk_dim_layer: ["-DDITHER_LAYER_NAME=\"" + mtk_dim_layer + "\""],
+        default: ["-DDITHER_LAYER_NAME=\"OnScreenFingerprintDimLayer\""],
+    })
 }
 
 cc_defaults {

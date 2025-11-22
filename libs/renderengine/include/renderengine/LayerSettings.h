@@ -166,6 +166,9 @@ struct LayerSettings {
     float whitePointNits = -1.f;
 
     std::shared_ptr<gui::DisplayLuts> luts;
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+    bool enableDither = false;
+#endif
 };
 
 // Keep in sync with custom comparison function in

@@ -139,6 +139,14 @@ public:
         int32_t sequence = -1;
     };
 
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+    struct Dither {
+        bool checked {false};
+        bool enabled {false};
+    };
+    Dither mDither;
+#endif
+
     // Describes the states of the release fence. Checking the states allows checks
     // to ensure that set_value() is not called on the same promise multiple times,
     // and can indicate if the promise has been fulfilled.
