@@ -357,6 +357,9 @@ SkiaRenderEngine::SkiaRenderEngine(Threaded threaded, PixelFormat pixelFormat,
     }
 
     mCapture = std::make_unique<SkiaCapture>();
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+    mSkiaDitherEffect = new SkiaDitherEffect();
+#endif
 }
 
 SkiaRenderEngine::~SkiaRenderEngine() { }
@@ -1027,6 +1030,21 @@ void SkiaRenderEngine::drawLayersInternal(
     if (kPrintLayerSettings) {
         logSettings(display);
     }
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+        bool enableDither = false;
+        float ditherAlpha = 1.0f;
+        int ditherDimLayerCnt = 0;
+        for (const auto& layer : layers) {
+            if (layer.enableDither){
+                enableDither = true;
+                ditherDimLayerCnt ++;
+                ditherAlpha = ditherAlpha*(1.0f - (float)layer.alpha);
+            }
+        }
+        if (enableDither) {
+            ALOGI("ditherAlpha %f, dim layer cnt %d", ditherAlpha, ditherDimLayerCnt);
+        }
+#endif
     for (const auto& layer : layers) {
         SFTRACE_FORMAT("DrawLayer: %s", layer.name.c_str());
 
@@ -1435,6 +1453,32 @@ void SkiaRenderEngine::drawLayersInternal(
 
             sk_sp<SkShader> shader;
 
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+            if (mSkiaDitherEffect != nullptr &&
+                mSkiaDitherEffect->isInitOK() &&
+                layer.enableDither) {
+                ditherDimLayerCnt --;
+                if (!isProtected() && ditherDimLayerCnt == 0) {
+                    sk_sp<SkImage>  image = activeSurface->makeImageSnapshot();
+                    sk_sp<SkShader> shader = image->makeShader(SkSamplingOptions());
+                    shader = mSkiaDitherEffect->createDitherShader(context, shader, ditherAlpha);
+                    if (shader != nullptr){
+                        paint.setShader(shader);
+                    }else {
+                        ALOGE("%s(), createDitherShader fail", __FUNCTION__);
+                    }
+                    paint.setBlendMode(SkBlendMode::kSrc);
+                    if (!bounds.isRect()) {
+                         paint.setAntiAlias(true);
+                         canvas->drawRRect(bounds, paint);
+                    } else {
+                         canvas->drawRect(bounds.rect(), paint);
+                    }
+                    skgpu::ganesh::Flush(activeSurface);
+                }
+                continue;
+            }
+#endif
             if (layer.source.buffer.useTextureFiltering) {
                 shader = image->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
                                            SkSamplingOptions(
@@ -1450,6 +1494,22 @@ void SkiaRenderEngine::drawLayersInternal(
                                                            toSkColorSpace(layerDataspace,
                                                                           colorSpaceOptions)));
             }
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+            if (isProtected() && mSkiaDitherEffect != nullptr &&
+                mSkiaDitherEffect->isInitOK() &&
+                enableDither &&
+                !layer.enableDither //not Dim layers
+                && ditherDimLayerCnt
+                ) {
+                shader = mSkiaDitherEffect->createDitherShader(context, shader, ditherAlpha);
+                if (shader != nullptr){
+                    paint.setShader(shader);
+                }else {
+                    ALOGE("%s(), createDitherShader fail", __FUNCTION__);
+                }
+            }
+            else { //original flow
+#endif
 
             SkRect imageBounds;
             matrix.mapRect(&imageBounds, SkRect::Make(image->bounds()));
@@ -1519,6 +1579,9 @@ void SkiaRenderEngine::drawLayersInternal(
                 paint.setColorFilter(
                         SkColorFilters::Matrix(colorMatrix, kDisplayColorTransformClamp));
             }
+#ifdef MTK_IN_DISPLAY_FINGERPRINT
+            }// original flow
+#endif
         } else {
             SFTRACE_NAME("DrawColor");
             const auto color = layer.source.solidColor;
