@@ -1156,6 +1156,9 @@ status_t HWComposer::getLuts(PhysicalDisplayId displayId,
     RETURN_IF_INVALID_DISPLAY(displayId, BAD_INDEX);
     auto& hwcDisplay = mDisplayData[displayId].hwcDisplay;
     auto error = hwcDisplay->getLuts(buffers, luts);
+    if (error == hal::Error::UNSUPPORTED) {
+        return NO_ERROR;
+    }
     RETURN_IF_HWC_ERROR(error, displayId, UNKNOWN_ERROR);
     return NO_ERROR;
 }
