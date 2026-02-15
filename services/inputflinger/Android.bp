@@ -41,8 +41,6 @@ cc_defaults {
         "-Wshadow-field-in-constructor-modified",
         "-Wshadow-uncaptured-local",
         "-Wthread-safety",
-        "-O3",
-        "-g0"
     ],
     sanitize: {
         misc_undefined: [
