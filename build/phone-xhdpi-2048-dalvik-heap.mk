@@ -12,15 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 # Provides overrides to configure the Dalvik heap for a 2GB phone
 # 192m of RAM gives enough space for 5 8 megapixel camera bitmaps in RAM.
 
-PRODUCT_VENDOR_PROPERTIES += \
+PRODUCT_PRODUCT_PROPERTIES += \
     dalvik.vm.heapstartsize?=8m \
     dalvik.vm.heapgrowthlimit?=192m \
     dalvik.vm.heapsize?=512m \
     dalvik.vm.heaptargetutilization?=0.75 \
     dalvik.vm.heapminfree?=2m \
-    dalvik.vm.heapmaxfree?=12m
+    dalvik.vm.heapmaxfree?=16m \
+    dalvik.vm.jitmaxsize?=128m \
+    dalvik.vm.jitinitialsize?=16m \
+    dalvik.vm.madvise.vdexfile.size?=104857600 \
+    dalvik.vm.madvise.odexfile.size?=104857600 \
+    dalvik.vm.usap_pool_enabled?=true \
+    dalvik.vm.usap_pool_size_max?=2
