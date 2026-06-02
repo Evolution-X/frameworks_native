@@ -29,6 +29,7 @@
 #define EGL_EGLEXT_PROTOTYPES
 
 #include <binder/IPCThreadState.h>
+
 #include <gui/BufferItem.h>
 #include <gui/BufferQueueCore.h>
 #include <gui/BufferQueueProducer.h>
@@ -50,6 +51,14 @@
 
 namespace android {
 using namespace com::android::graphics::libgui;
+
+namespace {
+
+bool lowLatencyFrameDropAllowed(int api) {
+    return api == NATIVE_WINDOW_API_EGL;
+}
+
+}
 
 // Macros for include BufferQueueCore information in log messages
 #define BQ_LOGV(x, ...)                                                                           \
@@ -1086,6 +1095,7 @@ status_t BufferQueueProducer::queueBuffer(int slot,
         item.mFence = acquireFence;
         item.mFenceTime = acquireFenceTime;
         item.mIsDroppable = mCore->mAsyncMode ||
+                lowLatencyFrameDropAllowed(mCore->mConnectedApi) ||
                 (mConsumerIsSurfaceFlinger && mCore->mQueueBufferCanDrop) ||
                 (mCore->mLegacyBufferDrop && mCore->mQueueBufferCanDrop) ||
                 (mCore->mSharedBufferMode && mCore->mSharedBufferSlot == slot);
