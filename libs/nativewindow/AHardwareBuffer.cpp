@@ -765,6 +765,24 @@ bool AHardwareBuffer_formatIsYuv(uint32_t format) {
         case AHARDWAREBUFFER_FORMAT_YCbCr_P010:
         case AHARDWAREBUFFER_FORMAT_YCbCr_P210:
             return true;
+        // Qualcomm vendor YUV formats — the source-built gralloc resolves camera
+        // buffers to these. Without recognizing them as YUV, AHardwareBuffer_lockPlanes
+        // returns only 1 plane (base pointer), leaving planes[1]/[2] uninitialized.
+        // This causes camera post-processing (ArcSoft APS) to compute garbage buffer
+        // dimensions from the stale planes[1] pointer, producing green/distorted photos.
+        case 0x7FA30C00: // HAL_PIXEL_FORMAT_NV21_ENCODEABLE
+        case 0x7FA30C01: // HAL_PIXEL_FORMAT_YCrCb_420_SP_ADRENO
+        case 0x7FA30C03: // HAL_PIXEL_FORMAT_YCbCr_420_SP_TILED
+        case 0x7FA30C04: // HAL_PIXEL_FORMAT_YCbCr_420_SP_VENUS
+        case 0x7FA30C06: // HAL_PIXEL_FORMAT_YCbCr_420_SP_VENUS_UBWC
+        case 0x7FA30C07: // HAL_PIXEL_FORMAT_YCbCr_420_SP_4R_UBWC
+        case 0x7FA30C09: // HAL_PIXEL_FORMAT_YCbCr_420_TP10_UBWC
+        case 0x7FA30C0A: // HAL_PIXEL_FORMAT_YCbCr_420_P010_VENUS
+        case 0x113:      // HAL_PIXEL_FORMAT_NV21_ZSL
+        case 0x114:      // HAL_PIXEL_FORMAT_YCrCb_420_SP_VENUS
+        case 0x116:      // HAL_PIXEL_FORMAT_NV12_HEIF
+        case 0x124:      // HAL_PIXEL_FORMAT_YCbCr_420_P010_UBWC
+            return true;
         default:
             return false;
     }
