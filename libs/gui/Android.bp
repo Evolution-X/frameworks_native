@@ -540,7 +540,10 @@ cc_defaults {
     cflags: [
         "-Wall",
         "-Werror",
-    ],
+    ] + select(soong_config_variable("libgui", "num_buffer_slots"), {
+        any @ value: ["-DNUM_BUFFER_SLOTS_OVERRIDE=" + value],
+        default: [],
+    }),
 
     cppflags: [
         "-Wextra",

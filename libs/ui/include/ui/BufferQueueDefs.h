@@ -22,7 +22,11 @@ namespace android {
         // BufferQueue will keep track of at most this value of buffers.
         // Attempts at runtime to increase the number of buffers past this
         // will fail.
+#ifdef NUM_BUFFER_SLOTS_OVERRIDE
+        static constexpr int NUM_BUFFER_SLOTS = NUM_BUFFER_SLOTS_OVERRIDE;
+#else
         static constexpr int NUM_BUFFER_SLOTS = 64;
+#endif
 
         enum {
             // A flag returned by dequeueBuffer when the client needs to call
