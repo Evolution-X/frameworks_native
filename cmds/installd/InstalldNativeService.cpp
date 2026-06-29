@@ -36,6 +36,9 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <time.h>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -426,6 +429,160 @@ using PackageLockGuard = std::lock_guard<PackageLock>;
     std::lock_guard lock(mLock)
 
 #endif // GRANULAR_LOCKS
+
+static constexpr size_t kTarBlock = 512;
+
+static void tarPutOctal(char* field, size_t len, uint64_t value) {
+    snprintf(field, len, "%0*llo", static_cast<int>(len - 1),
+             static_cast<unsigned long long>(value));
+}
+
+static bool tarWriteHeader(int fd, const std::string& path, uint64_t size, char type,
+                           time_t mtime) {
+    std::string name = path;
+    std::string prefix;
+
+    const bool isDir = (!name.empty() && name.back() == '/');
+    if (isDir) name.pop_back();
+
+    if (name.size() > 99) {
+        const size_t splitAt = name.find('/', name.size() - 100);
+        if (splitAt == std::string::npos) {
+            LOG(WARNING) << "tarAppData: path too long for ustar, skipping (" << name.size()
+                         << " bytes): " << name;
+            return false;
+        }
+        prefix = name.substr(0, splitAt);
+        name   = name.substr(splitAt + 1);
+        if (name.size() > 99 || prefix.size() > 154) {
+            LOG(WARNING) << "tarAppData: path split failed (name=" << name.size()
+                         << " prefix=" << prefix.size() << "), skipping: " << path;
+            return false;
+        }
+    }
+
+    char hdr[kTarBlock];
+    memset(hdr, 0, sizeof(hdr));
+
+    if (isDir) {
+        memcpy(hdr, name.c_str(), name.size());
+        hdr[name.size()] = '/';
+    } else {
+        memcpy(hdr, name.c_str(), name.size());
+    }
+    if (!prefix.empty()) memcpy(hdr + 345, prefix.c_str(), prefix.size());
+
+    tarPutOctal(hdr + 100, 8, type == '5' ? 0755 : 0644);
+    tarPutOctal(hdr + 108, 8, 0);
+    tarPutOctal(hdr + 116, 8, 0);
+    tarPutOctal(hdr + 124, 12, size);
+    tarPutOctal(hdr + 136, 12, static_cast<uint64_t>(mtime));
+    hdr[156] = type;
+    memcpy(hdr + 257, "ustar", 5);
+    memcpy(hdr + 263, "00", 2);
+
+    memset(hdr + 148, ' ', 8);
+    unsigned int sum = 0;
+    for (size_t i = 0; i < kTarBlock; i++) sum += static_cast<unsigned char>(hdr[i]);
+    tarPutOctal(hdr + 148, 8, sum);
+
+    return android::base::WriteFully(fd, hdr, kTarBlock);
+}
+
+static constexpr uint64_t kTarMaxFileSize  = (uint64_t)4  * 1024 * 1024 * 1024;
+static constexpr uint64_t kTarMaxTotalSize = (uint64_t)8  * 1024 * 1024 * 1024;
+static constexpr uint32_t kTarMaxEntries   = 100000;
+
+static int tarTree(int fd, const std::string& path, const std::string& rel,
+                   bool excludeCache, bool topLevel, std::vector<char>& ioBuf) {
+    std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(path.c_str()), closedir);
+    if (dir == nullptr) {
+        PLOG(WARNING) << "tarAppData: opendir failed for " << path;
+        return -errno;
+    }
+
+    struct dirent* de;
+    while ((de = readdir(dir.get())) != nullptr) {
+        const char* nm = de->d_name;
+        if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
+
+        if (topLevel && excludeCache &&
+                (!strcmp(nm, "cache") || !strcmp(nm, "code_cache"))) {
+            continue;
+        }
+
+        const std::string childPath = path + "/" + nm;
+        const std::string childRel = rel.empty() ? std::string(nm) : (rel + "/" + nm);
+
+        if (childRel.size() > 254) {
+            LOG(WARNING) << "tarAppData: skipping path > 254 bytes: " << childRel;
+            continue;
+        }
+
+        struct stat sb;
+        if (lstat(childPath.c_str(), &sb) != 0) {
+            PLOG(WARNING) << "tarAppData: lstat failed for " << childPath;
+            continue;
+        }
+
+        if (S_ISLNK(sb.st_mode)) {
+            continue;
+        } else if (S_ISDIR(sb.st_mode)) {
+            if (!tarWriteHeader(fd, childRel + "/", 0, '5', sb.st_mtime)) {
+                LOG(WARNING) << "tarAppData: failed to write dir header for " << childRel;
+                continue;
+            }
+            const int rc = tarTree(fd, childPath, childRel, excludeCache, false, ioBuf);
+            if (rc != 0) return rc;
+        } else if (S_ISREG(sb.st_mode)) {
+            unique_fd in(open(childPath.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+            if (in < 0) {
+                const int err = errno;
+                if (err == ELOOP  ||
+                    err == EACCES ||
+                    err == ENOENT) {
+                    PLOG(WARNING) << "tarAppData: skipping " << childPath;
+                    continue;
+                }
+                PLOG(ERROR) << "tarAppData: fatal open error for " << childPath;
+                return -err;
+            }
+            const uint64_t size = static_cast<uint64_t>(sb.st_size);
+            if (!tarWriteHeader(fd, childRel, size, '0', sb.st_mtime)) {
+                LOG(WARNING) << "tarAppData: failed to write file header for " << childRel;
+                continue;
+            }
+
+            uint64_t remaining = size;
+            while (remaining > 0) {
+                const size_t toRead = (size_t)std::min<uint64_t>(ioBuf.size(), remaining);
+                const ssize_t n = read(in, ioBuf.data(), toRead);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    PLOG(WARNING) << "tarAppData: read failed for " << childPath;
+                    return -errno;
+                }
+                if (n == 0) break;
+                if (!android::base::WriteFully(fd, ioBuf.data(), n)) return -EIO;
+                remaining -= n;
+            }
+            if (remaining > 0) {
+                std::fill(ioBuf.begin(), ioBuf.end(), 0);
+                while (remaining > 0) {
+                    const size_t chunk = (size_t)std::min<uint64_t>(ioBuf.size(), remaining);
+                    if (!android::base::WriteFully(fd, ioBuf.data(), chunk)) return -EIO;
+                    remaining -= chunk;
+                }
+            }
+            const size_t pad = (kTarBlock - (size % kTarBlock)) % kTarBlock;
+            if (pad) {
+                char z[kTarBlock] = {0};
+                if (!android::base::WriteFully(fd, z, pad)) return -EIO;
+            }
+        }
+    }
+    return 0;
+}
 
 }  // namespace
 
@@ -1929,6 +2086,667 @@ static void deleteDirsOnFailedRollback(const char* volume_uuid, const char* pack
             LOG(WARNING) << "Failed to delete rolled back pcc_ce_data " << pcc_ce_data;
         }
     }
+}
+
+binder::Status InstalldNativeService::tarAppData(const std::optional<std::string>& uuid,
+        const std::string& packageName, int32_t userId, int32_t storageFlags,
+        const ::android::os::ParcelFileDescriptor& outFd, bool excludeCache) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    CHECK_ARGUMENT_UUID(uuid);
+    CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+
+    const int fd = outFd.get();
+    if (fd < 0) {
+        return error("tarAppData received an invalid output fd");
+    }
+
+    std::string dataDir;
+    std::vector<std::string> extDirs;
+    {
+        LOCK_PACKAGE_USER();
+        const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+        const char* pkg = packageName.c_str();
+
+        if (storageFlags & FLAG_STORAGE_EXTERNAL) {
+            if (storageFlags & (FLAG_STORAGE_CE | FLAG_STORAGE_DE)) {
+                return error("tarAppData: FLAG_STORAGE_EXTERNAL must not be combined with CE/DE");
+            }
+            static const char* kExtTypes[] = {"data", "obb", "media"};
+            for (const char* extType : kExtTypes) {
+                extDirs.push_back(create_data_media_package_path(uuid_, userId, extType, pkg));
+            }
+        } else {
+            if ((storageFlags & FLAG_STORAGE_CE) && (storageFlags & FLAG_STORAGE_DE)) {
+                return error("tarAppData requires exactly one of FLAG_STORAGE_CE/FLAG_STORAGE_DE");
+            } else if (storageFlags & FLAG_STORAGE_CE) {
+                dataDir = create_data_user_ce_package_path(uuid_, userId, pkg);
+            } else if (storageFlags & FLAG_STORAGE_DE) {
+                dataDir = create_data_user_de_package_path(uuid_, userId, pkg);
+            } else {
+                return error("tarAppData requires FLAG_STORAGE_CE or FLAG_STORAGE_DE");
+            }
+        }
+    }
+
+    std::vector<char> ioBuf(65536);
+
+    if (!extDirs.empty()) {
+        static const char* kExtLabels[] = {"data", "obb", "media"};
+        for (size_t i = 0; i < extDirs.size(); i++) {
+            struct stat esb;
+            if (lstat(extDirs[i].c_str(), &esb) != 0 || !S_ISDIR(esb.st_mode)) continue;
+            if (!tarWriteHeader(fd, std::string(kExtLabels[i]) + "/", 0, '5', esb.st_mtime)) {
+                return error(StringPrintf("Failed to archive %s", extDirs[i].c_str()));
+            }
+            const int rc = tarTree(fd, extDirs[i], kExtLabels[i], excludeCache, true, ioBuf);
+            if (rc != 0) {
+                return error(StringPrintf("Failed to archive %s: %s",
+                        extDirs[i].c_str(), strerror(-rc)));
+            }
+        }
+    } else {
+        struct stat sb;
+        if (lstat(dataDir.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
+            const int rc = tarTree(fd, dataDir, "", excludeCache, true, ioBuf);
+            if (rc != 0) {
+                return error(StringPrintf("Failed to archive %s: %s",
+                        dataDir.c_str(), strerror(-rc)));
+            }
+        } else {
+            LOG(INFO) << "tarAppData: no data dir " << dataDir << "; writing empty archive";
+        }
+    }
+
+    char zero[kTarBlock] = {0};
+    if (!android::base::WriteFully(fd, zero, kTarBlock) ||
+            !android::base::WriteFully(fd, zero, kTarBlock)) {
+        return error("Failed to finalize tar for " + packageName);
+    }
+    return ok();
+}
+
+
+static uint64_t tarReadOctal(const char* field, size_t len) {
+    static const uint64_t kOctalOverflowSentinel = UINT64_MAX;
+    uint64_t val = 0;
+    size_t i = 0;
+    while (i < len && (field[i] == ' ' || field[i] == '\0')) i++;
+    for (; i < len && field[i] >= '0' && field[i] <= '7'; i++) {
+        const uint64_t digit = field[i] - '0';
+        if (val > (UINT64_MAX - digit) / 8) return kOctalOverflowSentinel;
+        val = val * 8 + digit;
+    }
+    return val;
+}
+
+static bool tarSanitizeName(const char* raw, size_t maxLen, std::string* out) {
+    const size_t nameLen = strnlen(raw, maxLen);
+    std::string name(raw, nameLen);
+    while (!name.empty() && name[0] == '/') name.erase(name.begin());
+    std::string result;
+    for (const auto& seg : android::base::Split(name, "/")) {
+        if (seg.empty() || seg == ".") continue;
+        if (seg == "..")               return false;
+        bool allDots = true;
+        for (char c : seg) { if (c != '.') { allDots = false; break; } }
+        if (allDots) return false;
+        if (!result.empty()) result += '/';
+        result += seg;
+    }
+    if (result.empty()) return false;
+    *out = result;
+    return true;
+}
+
+static bool tarValidateHeader(const char hdr[512], std::string* outPath) {
+    const bool posix = (memcmp(hdr + 257, "ustar\0", 6) == 0 &&
+                        memcmp(hdr + 263, "00",      2) == 0);
+    const bool gnu   = (memcmp(hdr + 257, "ustar  ", 7) == 0);
+    if (!posix && !gnu) {
+        LOG(WARNING) << "tarRestore: invalid ustar magic/version in tar header";
+        return false;
+    }
+    unsigned int stored = (unsigned int)tarReadOctal(hdr + 148, 8);
+    unsigned int computed = 0;
+    for (int i = 0; i < 512; i++) {
+        computed += (i >= 148 && i < 156)
+                ? (unsigned char)' '
+                : (unsigned char)hdr[i];
+    }
+    if (computed != stored) {
+        LOG(WARNING) << "tarRestore: checksum mismatch (stored=" << stored
+                     << " computed=" << computed << ")";
+        return false;
+    }
+    const std::string name(hdr,   strnlen(hdr,       100));
+    const std::string pfx (hdr + 345, strnlen(hdr + 345, 155));
+    *outPath = pfx.empty() ? name : (pfx + "/" + name);
+    return true;
+}
+
+static bool tarDrain(int fd, uint64_t count) {
+    char buf[4096];
+    while (count > 0) {
+        const size_t n = (size_t)std::min<uint64_t>(count, sizeof(buf));
+        if (!android::base::ReadFully(fd, buf, n)) return false;
+        count -= n;
+    }
+    return true;
+}
+
+static bool tarMkdirsExternal(const std::string& base, const std::string& rel, uid_t mediaUid) {
+    std::string cur = base;
+    for (const auto& seg : android::base::Split(rel, "/")) {
+        if (seg.empty()) continue;
+        cur += "/";
+        cur += seg;
+        if (mkdir(cur.c_str(), 0771) == 0) {
+            lchown(cur.c_str(), mediaUid, mediaUid);
+        } else if (errno != EEXIST) {
+            PLOG(WARNING) << "tarMkdirsExternal: mkdir failed for " << cur;
+            return false;
+        }
+    }
+    return true;
+}
+
+binder::Status InstalldNativeService::untarAppDataExternal(
+        const std::optional<std::string>& uuid, const std::string& packageName,
+        int32_t userId, const ::android::os::ParcelFileDescriptor& inFd) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    CHECK_ARGUMENT_UUID(uuid);
+    CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+
+    const int fd = inFd.get();
+    if (fd < 0) {
+        return error("untarAppDataExternal received an invalid input fd");
+    }
+
+    std::string dataRoot, obbRoot, mediaRoot;
+    uid_t mediaUid;
+    {
+        LOCK_PACKAGE_USER();
+        const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+        const char* pkg = packageName.c_str();
+        dataRoot  = create_data_media_package_path(uuid_, userId, "data",  pkg);
+        obbRoot   = create_data_media_package_path(uuid_, userId, "obb",   pkg);
+        mediaRoot = create_data_media_package_path(uuid_, userId, "media", pkg);
+        mediaUid  = multiuser_get_uid(userId, AID_MEDIA_RW);
+    }
+
+    std::vector<char> ioBuf(65536);
+    char hdr[kTarBlock];
+    uint32_t entryCount = 0;
+    uint64_t totalExtracted = 0;
+    while (true) {
+        if (!android::base::ReadFully(fd, hdr, kTarBlock)) break;
+        bool allZero = true;
+        for (size_t i = 0; i < kTarBlock; i++) { if (hdr[i]) { allZero = false; break; } }
+        if (allZero) break;
+
+        std::string rawPath;
+        if (!tarValidateHeader(hdr, &rawPath)) {
+            return error("untarAppDataExternal: invalid tar header (bad magic or checksum)");
+        }
+        if (++entryCount > kTarMaxEntries) {
+            return error(StringPrintf("untarAppDataExternal: exceeded max entry count (%u)",
+                    kTarMaxEntries));
+        }
+
+        const uint64_t size = tarReadOctal(hdr + 124, 12);
+        if (size == UINT64_MAX) {
+            return error("untarAppDataExternal: octal overflow in size field");
+        }
+        const uint64_t padded = (size + kTarBlock - 1) & ~((uint64_t)kTarBlock - 1);
+
+#define DRAIN_OR_FAIL(label) \
+    if (!tarDrain(fd, padded)) return error(label ": truncated archive while skipping entry")
+
+        std::string clean;
+        if (!tarSanitizeName(rawPath.c_str(), rawPath.size(), &clean)) {
+            DRAIN_OR_FAIL("untarAppDataExternal");
+            continue;
+        }
+        if (size > kTarMaxFileSize) {
+            LOG(WARNING) << "untarAppDataExternal: skipping oversized entry " << clean
+                         << " (" << size << " bytes)";
+            DRAIN_OR_FAIL("untarAppDataExternal");
+            continue;
+        }
+        if (size > kTarMaxTotalSize - totalExtracted) {
+            return error(StringPrintf("untarAppDataExternal: total extracted size would exceed "
+                    "limit (%" PRIu64 " bytes)", kTarMaxTotalSize));
+        }
+        const char type = hdr[156];
+
+        const auto segs = android::base::Split(clean, "/");
+        const std::string& top = segs[0];
+        std::string root;
+        if      (top == "data")  { root = dataRoot;  }
+        else if (top == "obb")   { root = obbRoot;   }
+        else if (top == "media") { root = mediaRoot; }
+        else { DRAIN_OR_FAIL("untarAppDataExternal"); continue; }
+
+        std::string rest;
+        for (size_t i = 1; i < segs.size(); i++) {
+            if (segs[i].empty()) continue;
+            if (!rest.empty()) rest += "/";
+            rest += segs[i];
+        }
+        std::string dest = rest.empty() ? root : (root + "/" + rest);
+        while (!dest.empty() && dest.back() == '/') dest.pop_back();
+
+        if (type == '5') {
+            if (!rest.empty() && !tarMkdirsExternal(root, rest, mediaUid)) {
+                return error(StringPrintf("untarAppDataExternal: mkdir failed for %s",
+                        dest.c_str()));
+            } else if (rest.empty()) {
+                if (mkdir(root.c_str(), 0771) == 0) {
+                    lchown(root.c_str(), mediaUid, mediaUid);
+                } else if (errno != EEXIST) {
+                    return error(StringPrintf("untarAppDataExternal: mkdir root failed for %s",
+                            root.c_str()));
+                }
+            }
+        } else if (type == '0' || type == '\0') {
+            if (!rest.empty()) {
+                const size_t slash = rest.find_last_of('/');
+                if (slash != std::string::npos) {
+                    if (!tarMkdirsExternal(root, rest.substr(0, slash), mediaUid)) {
+                        PLOG(WARNING) << "untarAppDataExternal: mkdir failed for parent of "
+                                      << dest << "; skipping file";
+                        DRAIN_OR_FAIL("untarAppDataExternal");
+                        continue;
+                    }
+                } else {
+                    if (mkdir(root.c_str(), 0771) != 0 && errno != EEXIST) {
+                        DRAIN_OR_FAIL("untarAppDataExternal");
+                        continue;
+                    }
+                }
+            }
+            unique_fd out(open(dest.c_str(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0660));
+            if (out.get() < 0) {
+                PLOG(WARNING) << "untarAppDataExternal: open failed for " << dest;
+                DRAIN_OR_FAIL("untarAppDataExternal");
+                continue;
+            }
+            {
+                struct stat outSb;
+                if (fstat(out.get(), &outSb) != 0 || !S_ISREG(outSb.st_mode)) {
+                    PLOG(WARNING) << "untarAppDataExternal: fd not a regular file: " << dest;
+                    DRAIN_OR_FAIL("untarAppDataExternal");
+                    continue;
+                }
+            }
+            uint64_t remaining = size;
+            while (remaining > 0) {
+                const size_t n = (size_t)std::min<uint64_t>(ioBuf.size(), remaining);
+                if (!android::base::ReadFully(fd, ioBuf.data(), n)) {
+                    return error("untarAppDataExternal: short read on file body");
+                }
+                if (!android::base::WriteFully(out.get(), ioBuf.data(), n)) {
+                    return error(StringPrintf("untarAppDataExternal: write failed for %s",
+                            dest.c_str()));
+                }
+                remaining -= n;
+            }
+            if (!tarDrain(fd, padded - size)) {
+                return error("untarAppDataExternal: truncated archive after file body");
+            }
+            fchown(out.get(), mediaUid, mediaUid);
+            fchmod(out.get(), 0660);
+            totalExtracted += size;
+        } else {
+            DRAIN_OR_FAIL("untarAppDataExternal");
+        }
+    }
+#undef DRAIN_OR_FAIL
+
+    return ok();
+}
+
+
+
+static bool tarMkdirsInternal(const std::string& base, const std::string& rel, uid_t uid) {
+    std::string cur = base;
+    for (const auto& seg : android::base::Split(rel, "/")) {
+        if (seg.empty()) continue;
+        cur += "/";
+        cur += seg;
+        if (mkdir(cur.c_str(), 0700) == 0) {
+            unique_fd dfd(open(cur.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+            if (dfd.get() >= 0) {
+                fchown(dfd.get(), uid, uid);
+            } else {
+                PLOG(WARNING) << "untarAppData: open dir for chown failed: " << cur;
+            }
+        } else if (errno == EEXIST) {
+            struct stat sb;
+            if (lstat(cur.c_str(), &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+                LOG(WARNING) << "untarAppData: path is not a directory: " << cur;
+                return false;
+            }
+        } else {
+            PLOG(WARNING) << "untarAppData: mkdir failed for " << cur;
+            return false;
+        }
+    }
+    return true;
+}
+
+binder::Status InstalldNativeService::untarAppData(
+        const std::optional<std::string>& uuid, const std::string& packageName,
+        int32_t userId, int32_t storageFlags, int32_t appId, const std::string& seInfo,
+        const ::android::os::ParcelFileDescriptor& inFd) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    CHECK_ARGUMENT_UUID(uuid);
+    CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+    CHECK_ARGUMENT_APP_ID(appId);
+
+    const bool ce = (storageFlags & FLAG_STORAGE_CE);
+    const bool de = (storageFlags & FLAG_STORAGE_DE);
+    if (ce == de) {
+        return error("untarAppData requires exactly one of FLAG_STORAGE_CE/FLAG_STORAGE_DE");
+    }
+
+    const int fd = inFd.get();
+    if (fd < 0) {
+        return error("untarAppData received an invalid input fd");
+    }
+
+    std::string base;
+    {
+        LOCK_PACKAGE_USER();
+        const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+        const char* pkg = packageName.c_str();
+        base = ce ? create_data_user_ce_package_path(uuid_, userId, pkg)
+                  : create_data_user_de_package_path(uuid_, userId, pkg);
+
+        if (delete_dir_contents(base, false) != 0) {
+            return error("untarAppData: failed to clear " + base);
+        }
+        if (ce) {
+            remove_path_xattr(base, kXattrInodeCache);
+            remove_path_xattr(base, kXattrInodeCodeCache);
+        }
+    }
+
+    const uid_t uid = multiuser_get_uid(userId, appId);
+    std::vector<char> ioBuf(65536);
+    char hdr[kTarBlock];
+    uint32_t entryCount = 0;
+    uint64_t totalExtracted = 0;
+    while (true) {
+        if (!android::base::ReadFully(fd, hdr, kTarBlock)) break;
+        bool allZero = true;
+        for (size_t i = 0; i < kTarBlock; i++) { if (hdr[i]) { allZero = false; break; } }
+        if (allZero) break;
+
+        std::string rawPath;
+        if (!tarValidateHeader(hdr, &rawPath)) {
+            return error("untarAppData: invalid tar header (bad magic or checksum)");
+        }
+        if (++entryCount > kTarMaxEntries) {
+            return error(StringPrintf("untarAppData: exceeded max entry count (%u)",
+                    kTarMaxEntries));
+        }
+
+        const uint64_t size = tarReadOctal(hdr + 124, 12);
+        if (size == UINT64_MAX) {
+            return error("untarAppData: octal overflow in size field");
+        }
+        const uint64_t padded = (size + kTarBlock - 1) & ~((uint64_t)kTarBlock - 1);
+
+#define DRAIN_OR_FAIL(label) \
+    if (!tarDrain(fd, padded)) return error(label ": truncated archive while skipping entry")
+
+        std::string clean;
+        if (!tarSanitizeName(rawPath.c_str(), rawPath.size(), &clean)) {
+            DRAIN_OR_FAIL("untarAppData");
+            continue;
+        }
+        if (size > kTarMaxFileSize) {
+            LOG(WARNING) << "untarAppData: skipping oversized entry " << clean
+                         << " (" << size << " bytes)";
+            DRAIN_OR_FAIL("untarAppData");
+            continue;
+        }
+        if (size > kTarMaxTotalSize - totalExtracted) {
+            return error(StringPrintf("untarAppData: total extracted size would exceed "
+                    "limit (%" PRIu64 " bytes)", kTarMaxTotalSize));
+        }
+        const char type = hdr[156];
+
+        while (!clean.empty() && clean.back() == '/') clean.pop_back();
+        if (clean.empty()) { DRAIN_OR_FAIL("untarAppData"); continue; }
+
+        const std::string dest = base + "/" + clean;
+
+        if (type == '5') {
+            if (!tarMkdirsInternal(base, clean, uid)) {
+                return error(StringPrintf("untarAppData: mkdir failed under %s", base.c_str()));
+            }
+        } else if (type == '0' || type == '\0') {
+            const size_t slash = clean.find_last_of('/');
+            if (slash != std::string::npos) {
+                if (!tarMkdirsInternal(base, clean.substr(0, slash), uid)) {
+                    return error(StringPrintf("untarAppData: mkdir failed under %s", base.c_str()));
+                }
+            }
+            unique_fd out(open(dest.c_str(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+            if (out.get() < 0) {
+                PLOG(WARNING) << "untarAppData: open failed for " << dest << ", skipping";
+                DRAIN_OR_FAIL("untarAppData");
+                continue;
+            }
+            {
+                struct stat outSb;
+                if (fstat(out.get(), &outSb) != 0 || !S_ISREG(outSb.st_mode)) {
+                    PLOG(WARNING) << "untarAppData: fd not a regular file: " << dest;
+                    DRAIN_OR_FAIL("untarAppData");
+                    continue;
+                }
+            }
+            uint64_t remaining = size;
+            while (remaining > 0) {
+                const size_t n = (size_t)std::min<uint64_t>(ioBuf.size(), remaining);
+                if (!android::base::ReadFully(fd, ioBuf.data(), n)) {
+                    return error("untarAppData: short read on file body");
+                }
+                if (!android::base::WriteFully(out.get(), ioBuf.data(), n)) {
+                    return error(StringPrintf("untarAppData: write failed for %s", dest.c_str()));
+                }
+                remaining -= n;
+            }
+            if (!tarDrain(fd, padded - size)) {
+                return error("untarAppData: truncated archive after file body");
+            }
+            fchown(out.get(), uid, uid);
+            totalExtracted += size;
+        } else {
+            DRAIN_OR_FAIL("untarAppData");
+        }
+    }
+#undef DRAIN_OR_FAIL
+
+    LOCK_PACKAGE_USER();
+    return restoreconAppDataLocked(uuid, packageName, userId, storageFlags, appId, seInfo);
+}
+
+
+
+static bool isValidArchiveId(const std::string& archiveId) {
+    if (archiveId.empty() || archiveId.size() > 128) return false;
+    if (archiveId.find('/') != std::string::npos) return false;
+    if (archiveId == "." || archiveId == "..") return false;
+    for (unsigned char c : archiveId) {
+        if (c < 0x20 || c == 0x7f) return false;
+    }
+    return true;
+}
+
+binder::Status InstalldNativeService::publishBackupArchive(
+        int32_t userId, const std::string& archiveId,
+        const ::android::os::ParcelFileDescriptor& inFd) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    if (!isValidArchiveId(archiveId)) {
+        return error("publishBackupArchive: invalid archiveId");
+    }
+    const int srcFd = inFd.get();
+    if (srcFd < 0) {
+        return error("publishBackupArchive received an invalid input fd");
+    }
+
+    const uid_t mediaUid = multiuser_get_uid(userId, AID_MEDIA_RW);
+    const std::string backupDir =
+            StringPrintf("/data/media/%d/AppDataBackup", userId);
+    const std::string destPath = backupDir + "/" + archiveId + ".vbak";
+    const std::string tmpPath  = destPath + ".tmp";
+
+    if (mkdir(backupDir.c_str(), 0771) != 0 && errno != EEXIST) {
+        return error(StringPrintf("publishBackupArchive: mkdir %s failed: %s",
+                backupDir.c_str(), strerror(errno)));
+    }
+
+    unique_fd destFd(open(tmpPath.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0660));
+    if (destFd.get() < 0) {
+        return error(StringPrintf("publishBackupArchive: cannot create %s: %s",
+                tmpPath.c_str(), strerror(errno)));
+    }
+
+    char buf[65536];
+    uint64_t totalWritten = 0;
+    while (true) {
+        const ssize_t n = read(srcFd, buf, sizeof(buf));
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            unlink(tmpPath.c_str());
+            return error(StringPrintf("publishBackupArchive: read error: %s",
+                    strerror(errno)));
+        }
+        totalWritten += (uint64_t)n;
+        if (totalWritten > kTarMaxTotalSize) {
+            unlink(tmpPath.c_str());
+            return error(StringPrintf("publishBackupArchive: input exceeds size "
+                    "limit (%" PRIu64 " bytes)", kTarMaxTotalSize));
+        }
+        if (!android::base::WriteFully(destFd.get(), buf, (size_t)n)) {
+            unlink(tmpPath.c_str());
+            return error(StringPrintf("publishBackupArchive: write error: %s",
+                    strerror(errno)));
+        }
+    }
+
+    if (fsync(destFd.get()) != 0) {
+        unlink(tmpPath.c_str());
+        return error(StringPrintf("publishBackupArchive: fsync failed: %s",
+                strerror(errno)));
+    }
+    fchown(destFd.get(), mediaUid, mediaUid);
+    fchmod(destFd.get(), 0660);
+    destFd.reset();
+
+    if (rename(tmpPath.c_str(), destPath.c_str()) != 0) {
+        unlink(tmpPath.c_str());
+        return error(StringPrintf("publishBackupArchive: rename failed: %s",
+                strerror(errno)));
+    }
+    return ok();
+}
+
+binder::Status InstalldNativeService::openBackupArchive(
+        int32_t userId, const std::string& archiveId,
+        ::android::os::ParcelFileDescriptor* _aidl_return) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    if (!isValidArchiveId(archiveId)) {
+        return error("openBackupArchive: invalid archiveId");
+    }
+    const std::string path = StringPrintf(
+            "/data/media/%d/AppDataBackup/%s.vbak", userId, archiveId.c_str());
+
+    unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (fd.get() < 0) {
+        return error(StringPrintf("openBackupArchive: cannot open %s: %s",
+                path.c_str(), strerror(errno)));
+    }
+    struct stat sb;
+    if (fstat(fd.get(), &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        return error(StringPrintf("openBackupArchive: %s is not a regular file",
+                path.c_str()));
+    }
+    *_aidl_return = ::android::os::ParcelFileDescriptor(std::move(fd));
+    return ok();
+}
+
+binder::Status InstalldNativeService::deleteBackupArchive(
+        int32_t userId, const std::string& archiveId) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    if (!isValidArchiveId(archiveId)) {
+        return error("deleteBackupArchive: invalid archiveId");
+    }
+    const std::string path = StringPrintf(
+            "/data/media/%d/AppDataBackup/%s.vbak", userId, archiveId.c_str());
+
+    struct stat sb;
+    if (lstat(path.c_str(), &sb) != 0) {
+        if (errno == ENOENT) return ok();
+        return error(StringPrintf("deleteBackupArchive: stat %s failed: %s",
+                path.c_str(), strerror(errno)));
+    }
+    if (!S_ISREG(sb.st_mode)) {
+        return error(StringPrintf("deleteBackupArchive: %s is not a regular file",
+                path.c_str()));
+    }
+    if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+        return error(StringPrintf("deleteBackupArchive: unlink %s failed: %s",
+                path.c_str(), strerror(errno)));
+    }
+    return ok();
+}
+
+binder::Status InstalldNativeService::listBackupArchives(int32_t userId,
+        std::vector<std::string>* _aidl_return) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    _aidl_return->clear();
+    const std::string dir = StringPrintf("/data/media/%d/AppDataBackup", userId);
+    std::unique_ptr<DIR, decltype(&closedir)> d(opendir(dir.c_str()), closedir);
+    if (d == nullptr) {
+        if (errno == ENOENT) {
+            return ok();
+        }
+        return error(StringPrintf("Failed to open %s: %s", dir.c_str(), strerror(errno)));
+    }
+    const std::string ext = ".vbak";
+    struct dirent* ent;
+    while ((ent = readdir(d.get())) != nullptr) {
+        std::string name(ent->d_name);
+        if (name == "." || name == "..") {
+            continue;
+        }
+        if (name.size() <= ext.size() ||
+                name.compare(name.size() - ext.size(), ext.size(), ext) != 0) {
+            continue;
+        }
+        const std::string full = StringPrintf("%s/%s", dir.c_str(), name.c_str());
+        struct stat st;
+        if (lstat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        _aidl_return->push_back(name.substr(0, name.size() - ext.size()));
+    }
+    return ok();
 }
 
 binder::Status InstalldNativeService::restoreAppDataSnapshot(
