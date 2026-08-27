@@ -124,6 +124,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -11047,7 +11048,12 @@ status_t SurfaceComposerAIDL::checkReadFrameBufferPermission() {
         }
     }
 
-    if (processName == "com.google.android.apps.nexuslauncher") {
+    static const std::unordered_set<std::string> sExemptLaunchers = {
+        "com.google.android.apps.nexuslauncher",
+        "com.android.launcher3",
+    };
+
+    if (sExemptLaunchers.count(processName) != 0) {
         return OK;
     }
 
