@@ -2008,9 +2008,11 @@ status_t SensorService::registerClientListener(
 
     status_t frozenErr = binder->addFrozenStateChangeCallback(recipient);
     if (frozenErr != OK) {
-        ALOGE("Failed to addFrozenStateChangeCallback (pid=%d, uid=%d), error=%d. "
-              "Cleaning up linkToDeath and aborting registration.",
-              pid, uid, frozenErr);
+        // Frozen-state notifications are optional on older kernels.
+        ALOGE_IF(frozenErr != INVALID_OPERATION,
+                 "Failed to addFrozenStateChangeCallback (pid=%d, uid=%d), error=%d. "
+                 "Cleaning up linkToDeath and aborting registration.",
+                 pid, uid, frozenErr);
         binder->unlinkToDeath(recipient); // Rollback linkToDeath
         return frozenErr;
     }
