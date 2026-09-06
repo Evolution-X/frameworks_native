@@ -154,7 +154,12 @@ static bool waitpid_with_timeout(
         siginfo_t info{};
         // WEXITED: Wait for processes that have exited.
         // WNOHANG: Don't block (though we know it's ready from poll).
-        if (waitid(P_PIDFD, fd, &info, WEXITED | WNOHANG) == 0) {
+        int ret = waitid(P_PIDFD, fd, &info, WEXITED | WNOHANG);
+        if (ret == -1 && errno == EINVAL) {
+            // Some kernels backport pidfd_open without waitid(P_PIDFD).
+            ret = waitid(P_PID, pid, &info, WEXITED | WNOHANG);
+        }
+        if (ret == 0) {
             status->exit_code_or_signal = info.si_status;
             if (info.si_code == CLD_EXITED) {
                 status->exited = true;
