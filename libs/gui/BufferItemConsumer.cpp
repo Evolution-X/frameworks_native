@@ -149,12 +149,16 @@ BufferItemConsumer::~BufferItemConsumer() {}
 
 void BufferItemConsumer::abandon() {
     DeferredFreedBufferNotifierAutoLock acc(mMutex, getBufferFreedListener());
-    ConsumerBase::abandonLocked(acc.getConsumerCallback());
+    if (!mAbandoned) {
+        ConsumerBase::abandonLocked(acc.getConsumerCallback());
+    }
 }
 
 void BufferItemConsumer::abandon(BufferFreedCallback onBufferFreed) {
     DeferredFreedBufferNotifierAutoLock acc(mMutex, onBufferFreed);
-    ConsumerBase::abandonLocked(acc.getConsumerCallback());
+    if (!mAbandoned) {
+        ConsumerBase::abandonLocked(acc.getConsumerCallback());
+    }
 }
 
 status_t BufferItemConsumer::setMaxAcquiredBufferCount(int maxAcquiredBuffers) {
