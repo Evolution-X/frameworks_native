@@ -37,7 +37,8 @@ public:
     // Downsample scale factor used to improve performance
     static constexpr float kInverseInputScale = 1.0f / kInputScale;
 
-    explicit BlurFilter(RuntimeEffectManager& effectManager, float maxCrossFadeRadius = 10.0f);
+    explicit BlurFilter(RuntimeEffectManager& effectManager, float maxCrossFadeRadius = 10.0f,
+                        float inputScale = kInputScale);
     virtual ~BlurFilter(){}
 
     // Execute blur, saving it to a TEMPORARY texture. WARNING: the returned SkImage is only
@@ -66,15 +67,23 @@ public:
 
     float getMaxCrossFadeRadius() const;
 
+    virtual uint32_t effectiveRadius(uint32_t radius) const;
+
     virtual void preallocateBuffers(SkiaGpuContext* context, ui::Size size) {}
     virtual bool areBuffersPreallocated(const SkiaGpuContext* context, ui::Size displaySize) const {
         return true;
     }
 
+protected:
+    float inputScale() const;
+    float inverseInputScale() const;
+
 private:
     // To avoid downscaling artifacts, we interpolate the blurred fbo with the full composited
     // image, up to this radius.
     const float mMaxCrossFadeRadius;
+    const float mInputScale;
+    const float mInverseInputScale;
 
     // Optional blend used for crossfade only if mMaxCrossFadeRadius > 0
     const sk_sp<SkRuntimeEffect> mMixEffect;
