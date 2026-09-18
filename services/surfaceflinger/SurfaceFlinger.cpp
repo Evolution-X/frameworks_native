@@ -3278,11 +3278,16 @@ std::optional<compositionengine::CompositionRefreshArgs> SurfaceFlinger::addOutp
         }
 
         const Fps refreshRate = display->getAdjustedRefreshRate();
-        const auto vsyncTime = FlagManager::getInstance().bugfix_virtual_display_refresh_rate()
+        static const bool useLegacyVdsRefreshPacing =
+                base::GetBoolProperty("ro.surface_flinger.use_legacy_vds_refresh_pacing", false);
+        const bool useVdsRefreshRateBugfix =
+                FlagManager::getInstance().bugfix_virtual_display_refresh_rate() &&
+                !useLegacyVdsRefreshPacing;
+        const auto vsyncTime = useVdsRefreshRateBugfix
                 ? pacesetterTarget.expectedPresentTime()
                 : pacesetterTarget.frameBeginTime();
         if (refreshRate.isValid() && !mScheduler->isVsyncInPhase(vsyncTime, refreshRate)) {
-            if (FlagManager::getInstance().bugfix_virtual_display_refresh_rate()) {
+            if (useVdsRefreshRateBugfix) {
                 mScheduler->scheduleFrame();
             }
             continue;
