@@ -1809,9 +1809,8 @@ Dumpstate::RunStatus Dumpstate::dumpstate() {
 
     if (android::base::GetBoolProperty("ro.logd.kernel", false)) {
         DoKernelLogcat();
-    } else {
-        do_dmesg();
     }
+    do_dmesg();
 
     DumpVintf();
 
