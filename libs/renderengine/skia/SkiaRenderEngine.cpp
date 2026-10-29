@@ -1230,15 +1230,20 @@ void SkiaRenderEngine::drawLayersInternal(
                     // the regions themselves, plus the blur radius around them so their edges
                     // still see the content next to them. Blurring the whole layer instead costs
                     // a full screen pass for every radius, e.g. for small Liquid Glass tiles over
-                    // a shade that blurs at a different radius.
+                    // a shade that blurs at a different radius. Glass that refracts sees
+                    // further out, as far as its rim reaches.
                     for (const auto& [radius, regions] : regionsPerRadius) {
                         SkRect regionsRect = SkRect::MakeEmpty();
-                        for (const BlurRegion& region : regions) {
-                            regionsRect.join(
-                                    canvas->getTotalMatrix().mapRect(getBlurRRect(region).rect()));
-                        }
                         const float margin = canvas->getTotalMatrix().mapRadius(radius);
-                        regionsRect.outset(margin, margin);
+                        for (const BlurRegion& region : regions) {
+                            const SkRRect rrect = getBlurRRect(region);
+                            SkRect rect = canvas->getTotalMatrix().mapRect(rrect.rect());
+                            const float reach = canvas->getTotalMatrix().mapRadius(
+                                    mBlurFilter->lensReach(rrect, region.material));
+                            const float outset = std::max(margin, reach);
+                            rect.outset(outset, outset);
+                            regionsRect.join(rect);
+                        }
                         SkRect regionsBlurRect = blurRect;
                         if (!regionsBlurRect.intersect(regionsRect)) {
                             continue;

@@ -17,6 +17,7 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 #include "BlurFilter.h"
 #include <SkBlendMode.h>
+#include <cmath>
 #include <SkM44.h>
 #include <SkCanvas.h>
 #include <SkPaint.h>
@@ -32,6 +33,7 @@
 #include <sys/system_properties.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -53,23 +55,44 @@ const SkString kEffectSource_BlurFilter_MixEffect(R"(
     }
 )");
 
-// PenguinOS Liquid Glass. A rounded blur region is drawn as a slab of glass: towards its rim the
-// glass curves like a lens and bends what's behind it inwards, the colours behind it are lifted,
-// and its rim catches the light, brightest along the top left.
-const SkString kEffectSource_LiquidGlassEffect(R"(
+// Glass slab rim: flat across the middle, rolling off along a squircle h(x) = (1 - (1 - x)^4)^(1/4),
+// x being the depth into the rim. Snell's law bends the view outwards along it.
+// lens: x = rim depth, y = shift at the very edge, z = refractive index, w = the largest
+// tan(incident - refracted), which scales the shift to y. lensHeight: rim height / rim depth.
+// lensRim: x = width, y = strength of the light caught along the rim (dock material only).
+#define LENS_SKSL                                                                   \
+    "uniform float4 lens;\n"                                                       \
+    "uniform float lensHeight;\n"                                                  \
+    "uniform float2 lensRim;\n"                                                   \
+    "float2 lensNormal(float2 rel, float2 h, float r) {\n"                         \
+    "    float2 q = abs(rel) - (h - r);\n"                                         \
+    "    float2 n = (q.x > 0.0 && q.y > 0.0) ? normalize(q)\n"                     \
+    "             : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));\n"          \
+    "    return n * float2(rel.x < 0.0 ? -1.0 : 1.0, rel.y < 0.0 ? -1.0 : 1.0);\n" \
+    "}\n"                                                                          \
+    "float lensShift(float depth) {\n"                                             \
+    "    float k = 1.0 - clamp(depth / lens.x, 0.0, 1.0);\n"                       \
+    "    if (k <= 0.0 || lens.y <= 0.0) return 0.0;\n"                             \
+    "    float k3 = k * k * k;\n"                                                  \
+    "    float slope = lensHeight * k3 / pow(max(1.0 - k3 * k, 1e-4), 0.75);\n"    \
+    "    float incident = atan(slope);\n"                                          \
+    "    float refracted = asin(sin(incident) / lens.z);\n"                        \
+    "    return lens.y * tan(incident - refracted) / lens.w;\n"                    \
+    "}\n"
+
+// Evolution Liquid Glass: the rim refracts, the colours behind are lifted and the rim catches light
+const SkString kEffectSource_LiquidGlassEffect(LENS_SKSL R"(
     uniform shader blurredInput;
     uniform shader originalInput;
     uniform float clarity;
     uniform float4 bounds;
     uniform float radius;
     uniform float band;
-    uniform float refraction;
     uniform float rim;
     uniform float saturation;
     uniform float gain;
     uniform float lift;
     uniform float edgeClear;
-    uniform float curve;
 
     float roundRect(float2 p, float2 c, float2 h, float r) {
         float2 q = abs(p - c) - (h - r);
@@ -83,19 +106,11 @@ const SkString kEffectSource_LiquidGlassEffect(R"(
         float d = roundRect(xy, c, h, r);
         // The outward normal straight from the distance field's own terms, rather than by four
         // more evaluations of it per pixel.
-        float2 rel = xy - c;
-        float2 q = abs(rel) - (h - r);
-        float2 n = (q.x > 0.0 && q.y > 0.0) ? normalize(q)
-                 : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
-        n *= float2(rel.x < 0.0 ? -1.0 : 1.0, rel.y < 0.0 ? -1.0 : 1.0);
+        float2 n = lensNormal(xy - c, h, r);
 
         // 0 across the flat middle, 1 at the very edge.
         float t = clamp(1.0 + d / band, 0.0, 1.0);
-        // The rim bends what's behind it as a lens would: along a ramp, or as a dome, steepest
-        // right at the edge where the glass curves away.
-        float dome = 1.0 - sqrt(max(1.0 - t * t, 0.0));
-        float bend = refraction * mix(t * t * t, dome, curve);
-        float2 src = xy - n * bend;
+        float2 src = xy + n * lensShift(-d);
         // Frosted across the middle so what sits on the glass stays legible, clearer towards the
         // rim, where the bent picture of what's behind shows through.
         float clear = clarity + (1.0 - clarity) * edgeClear * t * t;
@@ -117,7 +132,7 @@ const SkString kEffectSource_LiquidGlassEffect(R"(
     }
 )");
 
-const SkString kEffectSource_CosGlassEffect(R"(
+const SkString kEffectSource_CosGlassEffect(LENS_SKSL R"(
     uniform shader blurredInput;
     uniform half4 modes;
     uniform half4 color0;
@@ -243,7 +258,18 @@ const SkString kEffectSource_CosGlassEffect(R"(
         return col;
     }
     half4 main(float2 xy) {
-        half4 col = blurredInput.eval(xy);
+        float2 halfSize = (bounds.zw - bounds.xy) * 0.5;
+        float2 pos = xy - (bounds.xy + halfSize);
+        float corner = min(radius, min(halfSize.x, halfSize.y));
+        float d = rbox(pos, halfSize, corner);
+        float2 src = xy;
+        float2 n = float2(0.0);
+        // The dock's material, in the iOS style, refracts what lies beyond its rim.
+        if (lens.y > 0.0 || lensRim.y > 0.0) {
+            n = lensNormal(pos, halfSize, corner);
+            src += n * lensShift(-d);
+        }
+        half4 col = blurredInput.eval(src);
         half3 rgb = layer(col.rgb, modes.x, color0);
         rgb = layer(rgb, modes.y, color1);
         rgb = layer(rgb, modes.z, color2);
@@ -252,12 +278,16 @@ const SkString kEffectSource_CosGlassEffect(R"(
         half luma = dot(rgb, half3(0.2126, 0.7152, 0.0722));
         rgb = saturate(mix(half3(luma), rgb, lift.z));
         if (edge[7] + edge[8] > 0.0 || glow[0] > 0.0) {
-            float2 halfSize = (bounds.zw - bounds.xy) * 0.5;
-            float2 pos = xy - (bounds.xy + halfSize);
-            float corner = min(radius, min(halfSize.x, halfSize.y));
-            float d = rbox(pos, halfSize, corner);
             rgb = innerGlow(xy, pos, halfSize, corner, d, rgb);
             rgb = rimLight(pos, halfSize, d, rgb, col.rgb);
+        }
+        if (lensRim.y > 0.0) {
+            // Light from the top left catches the rim where it faces it and bounces faintly off
+            // the far side; the edges turned across it stay dim.
+            float e = 1.0 - smoothstep(0.0, lensRim.x, -d);
+            float facing = dot(n, float2(-0.5145, -0.8575));
+            float spec = pow(max(facing, 0.0), 2.0) + 0.45 * pow(max(-facing, 0.0), 2.0);
+            rgb = saturate(rgb + half(lensRim.y * e * (0.15 + 0.85 * spec)));
         }
         return half4(rgb, 1.0);
     }
@@ -352,6 +382,76 @@ static float tune(const char* name, float fallback) {
 
 void BlurFilter::setDisplay(const std::string& namePlusId) {
     mLiquidGlass = mLiquidGlassEffect != nullptr && liquidGlassEnabledFor(namePlusId);
+}
+
+// The rim lens of a glass slab (see LENS_SKSL), in the region's own coordinates. A zero shift
+// leaves what's behind the glass where it is.
+struct GlassLens {
+    float depth = 1.0f;
+    float shift = 0.0f;
+    float ior = 1.5f;
+    float scale = 1.0f;
+    float height = 1.0f;
+    float rimWidth = 0.0f;
+    float rimStrength = 0.0f;
+};
+
+// How far glass rims refract, from the Liquid Glass Refraction setting: 0-100% of the
+// strongest bend, 60% by default. debug.lg.sf.lens overrides it while tuning.
+static float refractionStrength() {
+    static CachedProperty percent("persist.sys.evolution.liquid_glass_refraction");
+    const std::string& value = percent.get();
+    const int amount = std::clamp(value.empty() ? 60 : std::atoi(value.c_str()), 0, 100);
+    return std::max(tune("lens", amount * 0.015f), 0.0f);
+}
+
+// One dp in pixels, for the rim's width.
+static float densityScale() {
+    static const float scale = [] {
+        char value[PROP_VALUE_MAX] = {};
+        const int density =
+                __system_property_get("ro.sf.lcd_density", value) > 0 ? std::atoi(value) : 0;
+        return density > 0 ? density / 160.0f : 3.0f;
+    }();
+    return scale;
+}
+
+// In the iOS style, the dock's material (11) is glass like iPadOS's dock and Search field, and
+// so is every other rounded slab outside COS's own materials. ColorOS's glass is frosted only.
+static bool iosGlass(const SkRRect& region, int32_t material, bool liquidGlass) {
+    if (region.isRect() || !liquidGlass || cosGlassStyle()) return false;
+    return material == 11 || material == 0;
+}
+
+static GlassLens glassLens(const SkRRect& region, int32_t material, bool liquidGlass) {
+    GlassLens lens;
+    if (!iosGlass(region, material, liquidGlass)) return lens;
+    const SkRect& rect = region.rect();
+    const float corner = region.radii(SkRRect::kUpperLeft_Corner).fX;
+    const float half = std::min(rect.width(), rect.height()) * 0.5f;
+    if (half < 1.0f) return lens;
+    // The rim curves away over the corner's depth, never past the middle of the slab.
+    lens.depth = std::clamp(corner * tune("lens_band", 1.0f), std::min(6.0f, half), half);
+    lens.shift = lens.depth * refractionStrength();
+    lens.ior = std::max(tune("lens_ior", 1.5f), 1.01f);
+    lens.height = std::max(tune("lens_height", 1.0f), 0.01f);
+    // At the very edge the surface stands upright: tan(90deg - critical angle).
+    lens.scale = std::tan(static_cast<float>(M_PI_2) - std::asin(1.0f / lens.ior));
+    if (material == 11) {
+        lens.rimWidth = tune("lens_rim_dp", 1.5f) * densityScale();
+        lens.rimStrength = std::max(tune("lens_rim", 0.35f), 0.0f);
+    }
+    return lens;
+}
+
+static void setLensUniforms(SkRuntimeShaderBuilder& builder, const GlassLens& lens) {
+    builder.uniform("lens") = SkV4{lens.depth, lens.shift, lens.ior, lens.scale};
+    builder.uniform("lensHeight") = lens.height;
+    builder.uniform("lensRim") = SkV2{std::max(lens.rimWidth, 0.5f), lens.rimStrength};
+}
+
+float BlurFilter::lensReach(const SkRRect& region, int32_t material) const {
+    return glassLens(region, material, mLiquidGlass).shift;
 }
 
 struct CosGlassLayers {
@@ -557,6 +657,7 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
         glass.uniform("radius") = corner;
         glass.uniform("edge").set(edge, 16);
         glass.uniform("glow").set(glow, 9);
+        setLensUniforms(glass, glassLens(effectRegion, material, mLiquidGlass));
         paint.setShader(glass.makeShader());
         paint.setAntiAlias(true);
         canvas->drawRRect(effectRegion, paint);
@@ -588,14 +689,13 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
         glass.uniform("bounds") = SkV4{rect.fLeft, rect.fTop, rect.fRight, rect.fBottom};
         glass.uniform("radius") = radius;
         glass.uniform("band") = band;
-        glass.uniform("refraction") = slab ? band * tune("refraction", 0.5f) : 0.0f;
+        setLensUniforms(glass, glassLens(effectRegion, material, mLiquidGlass));
         glass.uniform("rim") = slab ? tune("rim", 0.0f) : 0.0f;
         // A whole window's backdrop, such as the shade's, gets iOS's vivid blur.
         glass.uniform("saturation") = slab ? tune("slab_sat", 1.1f) : tune("window_sat", 0.5f);
         glass.uniform("gain") = slab ? tune("slab_gain", 0.9f) : tune("window_gain", 1.04f);
         glass.uniform("lift") = slab ? tune("slab_lift", 0.0f) : tune("window_lift", 0.02f);
         glass.uniform("edgeClear") = tune("edge_clear", 0.08f);
-        glass.uniform("curve") = tune("curve", 1.0f);
         paint.setShader(glass.makeShader());
         if (slab) {
             paint.setAntiAlias(true);

@@ -69,6 +69,10 @@ public:
 
     float getMaxCrossFadeRadius() const;
 
+    // How far beyond the region its glass rim refracts from, in the region coordinates, so
+    // the blurred backdrop can be made to cover it. 0 for glass that does not refract.
+    float lensReach(const SkRRect& region, int32_t material) const;
+
     // Picks Liquid Glass or plain blur for the display about to be drawn.
     void setDisplay(const std::string& namePlusId);
 
