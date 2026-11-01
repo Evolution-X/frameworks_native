@@ -212,18 +212,6 @@ sk_sp<SkImage> KawaseBlurDualFilterV2::generateTemporaryImage(SkiaGpuContext* co
     SkIRect targetBlurRect;
     blurRect.roundIn(&targetBlurRect);
 
-    auto makeSurface = [&](float scale) -> sk_sp<SkSurface> {
-        const int newW =
-                std::max(1, static_cast<int>(static_cast<float>(targetBlurRect.width()) / scale));
-        const int newH =
-                std::max(1, static_cast<int>(static_cast<float>(targetBlurRect.height()) / scale));
-        sk_sp<SkSurface> surface =
-                context->createRenderTarget(input->imageInfo().makeWH(newW, newH));
-        LOG_THREAD_STATE_AND_CRASH_IF(!surface, "%s: Failed to create surface for blurring!",
-                                      __func__);
-        return surface;
-    };
-
     auto makeImageInfo = [&](float scale) -> SkImageInfo {
         const int newW =
                 std::max(1, static_cast<int>(static_cast<float>(targetBlurRect.width()) / scale));
@@ -244,10 +232,28 @@ sk_sp<SkImage> KawaseBlurDualFilterV2::generateTemporaryImage(SkiaGpuContext* co
     sk_sp<SkSurface> surfaces[kMaxSurfaces];
     SkImageInfo imageInfos[kMaxSurfaces];
     if (!usesPreallocatedTextures) {
+        // createRenderTarget surfaces are unbudgeted, so Skia frees them every frame. Keep surfaces sized
+        // for the whole input and blur into their top-left sub-rect, as the preallocated path does.
+        auto& cachedSurfaces = isProtected ? mCachedProtectedSurfaces : mCachedSurfaces;
+        const int baseWidth = std::max(input->width(), targetBlurRect.width());
+        const int baseHeight = std::max(input->height(), targetBlurRect.height());
         for (int i = 0; i < kMaxSurfaces; i++) {
-            surfaces[i] = filterPasses >= i ? makeSurface(kScales[i]) : nullptr;
-            imageInfos[i] = surfaces[i] != nullptr ? surfaces[i]->imageInfo() : SkImageInfo();
+            if (filterPasses < i) {
+                continue;
+            }
+            const SkImageInfo info = input->imageInfo().makeWH(
+                    std::max(1, static_cast<int>(static_cast<float>(baseWidth) / kScales[i])),
+                    std::max(1, static_cast<int>(static_cast<float>(baseHeight) / kScales[i])));
+            if (!cachedSurfaces[i] || cachedSurfaces[i]->imageInfo() != info) {
+                cachedSurfaces[i] = context->createRenderTarget(info);
+                LOG_THREAD_STATE_AND_CRASH_IF(!cachedSurfaces[i],
+                                              "%s: Failed to create surface for blurring!",
+                                              __func__);
+            }
+            surfaces[i] = cachedSurfaces[i];
+            imageInfos[i] = makeImageInfo(kScales[i]);
         }
+        usesPreallocatedTextures = true;
     } else {
         for (int i = 0; i < kMaxSurfaces; i++) {
             surfaces[i] = preallocatedTexturesRef[i]->getOrCreateSurface(display.outputDataspace);

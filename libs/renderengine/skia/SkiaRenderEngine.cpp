@@ -385,6 +385,7 @@ void SkiaRenderEngine::finishRenderingAndAbandonContexts() {
     mTextureCleanupMgr.setDeferredStatus(false);
     mTextureCleanupMgr.cleanup();
     mCompositionLayerSurface.reset();
+    mBlurInputCopySurface.reset();
 
     // ~SkiaGpuContext must be called before GPU API contexts are torn down.
     mContext.reset();
@@ -400,6 +401,7 @@ void SkiaRenderEngine::useProtectedContext(bool useProtectedContext) {
     // Release the cached surface while its owning context is still active. Graphite surfaces
     // have no recordingContext(), so that comparison alone cannot detect a context switch.
     mCompositionLayerSurface.reset();
+    mBlurInputCopySurface.reset();
 
     // If the active context's cache management policy is to get rid of purgeable resources upon
     // switching contexts, then handle doing so here.
@@ -1189,8 +1191,27 @@ void SkiaRenderEngine::drawLayersInternal(
                     if (requiresCrossFadeWithBlurInput) {
                         // If we require cross fading with the blur input, we need to make sure we
                         // make a copy of the surface to the image since we will be writing to the
-                        // surface while sampling the blurInput.
-                        blurInput = activeSurface->makeImageSnapshot();
+                        // surface while sampling the blurInput. Copy into a surface kept across
+                        // frames: a snapshot would be copied on write into a freshly allocated
+                        // full-screen image every frame, which stalls RenderEngine for several ms.
+                        if (!mBlurInputCopySurface ||
+                            mBlurInputCopySurface->imageInfo() != activeSurface->imageInfo() ||
+                            mBlurInputCopySurface->recordingContext() !=
+                                    activeSurface->recordingContext()) {
+                            mBlurInputCopySurface =
+                                    activeSurface->makeSurface(activeSurface->imageInfo());
+                        }
+                        if (mBlurInputCopySurface) {
+                            SkPaint copyPaint;
+                            copyPaint.setBlendMode(SkBlendMode::kSrc);
+                            SkCanvas* copyCanvas = mBlurInputCopySurface->getCanvas();
+                            copyCanvas->restoreToCount(1);
+                            copyCanvas->drawImage(activeSurface->makeTemporaryImage(), 0, 0,
+                                                  SkSamplingOptions(), &copyPaint);
+                            blurInput = mBlurInputCopySurface->makeTemporaryImage();
+                        } else {
+                            blurInput = activeSurface->makeImageSnapshot();
+                        }
                     } else {
                         blurInput = activeSurface->makeTemporaryImage();
                     }

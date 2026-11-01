@@ -79,6 +79,9 @@ private:
     std::shared_ptr<AutoBackendTexture::LocalRef> mProtectedTextures[kMaxSurfaces];
     ui::Size mUnprotectedDisplaySize;
     ui::Size mProtectedDisplaySize;
+    // Blur surfaces kept across frames when the preallocated textures are not in use.
+    mutable sk_sp<SkSurface> mCachedSurfaces[kMaxSurfaces];
+    mutable sk_sp<SkSurface> mCachedProtectedSurfaces[kMaxSurfaces];
 
     void blurInto(const sk_sp<SkSurface>& drawSurface, const int destWidth,
                   const sk_sp<SkImage>& readImage, const SkIRect& srcRect,
