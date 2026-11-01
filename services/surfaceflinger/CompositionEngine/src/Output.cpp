@@ -1457,18 +1457,10 @@ std::optional<base::unique_fd> Output::composeSurfaces(
                                             clientCompositionLayers);
     }
 
-    // We boost GPU frequency here because there will be color spaces conversion
-    // or complex GPU shaders and it's expensive. We boost the GPU frequency so that
-    // GPU composition can finish in time. We must reset GPU frequency afterwards,
-    // because high frequency consumes extra battery.
-    const bool expensiveBlurs = mLayerRequestingBackgroundBlur != nullptr;
-    const bool expensiveRenderingExpected = expensiveBlurs ||
-            std::any_of(clientCompositionLayers.begin(), clientCompositionLayers.end(),
-                        [outputDataspace =
-                                 clientCompositionDisplay.outputDataspace](const auto& layer) {
-                            return layer.sourceDataspace != ui::Dataspace::UNKNOWN
-                                    && layer.sourceDataspace != outputDataspace;
-                        });
+    // Blur shaders are expensive, so boost the GPU frequency and reset it afterwards to save
+    // battery. A color space conversion alone is cheap and would hold the boost through all GPU
+    // composition.
+    const bool expensiveRenderingExpected = mLayerRequestingBackgroundBlur != nullptr;
     if (expensiveRenderingExpected) {
         setExpensiveRenderingExpected(true);
     }
