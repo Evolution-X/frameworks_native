@@ -383,6 +383,7 @@ void SkiaRenderEngine::finishRenderingAndAbandonContexts() {
     // before ~SkiaGpuContext is called.
     mTextureCleanupMgr.setDeferredStatus(false);
     mTextureCleanupMgr.cleanup();
+    mCompositionLayerSurface.reset();
 
     // ~SkiaGpuContext must be called before GPU API contexts are torn down.
     mContext.reset();
@@ -394,6 +395,10 @@ void SkiaRenderEngine::useProtectedContext(bool useProtectedContext) {
         (useProtectedContext && !supportsProtectedContent())) {
         return; // No context switch is required
     }
+
+    // Release the cached surface while its owning context is still active. Graphite surfaces
+    // have no recordingContext(), so that comparison alone cannot detect a context switch.
+    mCompositionLayerSurface.reset();
 
     // If the active context's cache management policy is to get rid of purgeable resources upon
     // switching contexts, then handle doing so here.
@@ -1006,7 +1011,18 @@ void SkiaRenderEngine::drawLayersInternal(
                 }
             }
             if (requiresCompositionLayer) {
-                activeSurface = dstSurface->makeSurface(dstSurface->imageInfo());
+                // Keep the surface across frames to avoid reallocating it during blur fades
+                // when Skia's resource cache is full.
+                if (!mCompositionLayerSurface ||
+                    mCompositionLayerSurface->imageInfo() != dstSurface->imageInfo() ||
+                    mCompositionLayerSurface->recordingContext() !=
+                            dstSurface->recordingContext()) {
+                    mCompositionLayerSurface = dstSurface->makeSurface(dstSurface->imageInfo());
+                }
+                // Switching away from this layer below does not restore its canvas, so drop
+                // what the previous frame left on it.
+                mCompositionLayerSurface->getCanvas()->restoreToCount(1);
+                activeSurface = mCompositionLayerSurface;
                 canvas = mCapture->tryOffscreenCapture(activeSurface.get(), &offscreenCaptureState);
                 blurCompositionLayer = &layer;
                 break;
