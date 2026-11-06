@@ -1927,6 +1927,8 @@ status_t SurfaceFlinger::setActiveColorMode(const sp<IBinder>& displayToken, ui:
 
         display->getCompositionDisplay()->setColorProfile(
                 {mode, Dataspace::UNKNOWN, RenderIntent::COLORIMETRIC});
+        mContentGeneration++;
+        scheduleSample();
 
         return NO_ERROR;
     });
@@ -2430,6 +2432,9 @@ status_t SurfaceFlinger::setDisplayBrightness(const sp<IBinder>& displayToken,
                        FTL_FAKE_GUARD(kMainThreadContext,
                                       display->updateHdrSdrRatioOverlayRatio(currentHdrSdrRatio));
 
+                       // Screenshots, and so region sampling, depend on the brightness
+                       mContentGeneration++;
+                       scheduleSample();
                        if (brightness.sdrWhitePointNits / brightness.displayBrightnessNits !=
                            currentDimmingRatio) {
                            scheduleComposite(FrameHint::kNone);
@@ -2550,6 +2555,7 @@ void SurfaceFlinger::scheduleComposite(FrameHint hint) {
 
 void SurfaceFlinger::scheduleRepaint() {
     mGeometryDirty = true;
+    mContentGeneration++;
     scheduleComposite(FrameHint::kActive);
 }
 
@@ -3164,10 +3170,14 @@ bool SurfaceFlinger::commit(PhysicalDisplayId pacesetterId,
 
         const bool flushTransactions = clearTransactionFlags(eTransactionFlushNeeded);
         bool transactionsAreEmpty = false;
-        mustComposite |=
+        const bool contentChanged =
                 updateLayerSnapshots(vsyncId, pacesetterFrameTargetPtr->frameBeginTime().ns(),
                                      pacesetterFrameTargetPtr->expectedPresentTime().ns(),
                                      flushTransactions, transactionsAreEmpty);
+        if (contentChanged) {
+            mContentGeneration++;
+        }
+        mustComposite |= contentChanged;
 
         // A display transaction for hotplug reconnect may have just destroyed the original.
         pacesetterFrameTargetPtr = mScheduler->pacesetterFrameTarget();
@@ -9551,7 +9561,7 @@ void SurfaceFlinger::sample() {
     const auto scheduleFrameTimeOpt = scheduledFrameResultOpt
             ? std::optional{scheduledFrameResultOpt->callbackTime}
             : std::nullopt;
-    mRegionSamplingThread->onCompositionComplete(scheduleFrameTimeOpt);
+    mRegionSamplingThread->onCompositionComplete(scheduleFrameTimeOpt, mContentGeneration);
 }
 
 sp<DisplayDevice> SurfaceFlinger::findFrontInternalDisplay() const FTL_FAKE_GUARD(mStateLock) {
@@ -9571,6 +9581,8 @@ void SurfaceFlinger::onNewFrontInternalDisplay(const DisplayDevice* oldFrontInte
     SFTRACE_CALL();
 
     mFrontInternalDisplayId = newFrontInternalDisplay.getPhysicalId();
+    // Region sampling captures the front internal display
+    mContentGeneration++;
 
     mFrontInternalDisplayTransformHint = newFrontInternalDisplay.getTransformHint();
     sFrontInternalDisplayRotationFlags =

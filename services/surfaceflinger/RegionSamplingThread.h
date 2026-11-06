@@ -84,8 +84,11 @@ public:
     // Notifies sampling engine that composition is done and new content is
     // available, and the deadline for the sampling work on the main thread to
     // be completed without eating the budget of another frame.
+    // contentGeneration changes whenever visible content may have changed; when it matches the
+    // last sampled one, the sampled regions look the same and are not sampled again.
     void onCompositionComplete(
-            std::optional<std::chrono::steady_clock::time_point> samplingDeadline);
+            std::optional<std::chrono::steady_clock::time_point> samplingDeadline,
+            uint64_t contentGeneration);
 
 private:
     struct Descriptor {
@@ -98,11 +101,13 @@ private:
             const sp<GraphicBuffer>& buffer, const Point& leftTop,
             const std::vector<RegionSamplingThread::Descriptor>& descriptors);
 
-    void doSample(std::optional<std::chrono::steady_clock::time_point> samplingDeadline);
+    void doSample(std::optional<std::chrono::steady_clock::time_point> samplingDeadline,
+                  uint64_t contentGeneration);
     void binderDied(const wp<IBinder>& who) override;
     void checkForStaleLuma();
 
-    void captureSample();
+    void captureSample(uint64_t contentGeneration);
+    void retryAfterFailedCapture();
     void threadMain();
 
     SurfaceFlinger& mFlinger;
@@ -118,6 +123,11 @@ private:
     std::optional<std::chrono::steady_clock::time_point> mSampleRequestTime
             GUARDED_BY(mThreadControlMutex);
     std::chrono::steady_clock::time_point mLastSampleTime GUARDED_BY(mThreadControlMutex);
+
+    static constexpr uint64_t kNoGeneration = UINT64_MAX;
+    // Content generation of the sample being captured, and of the last delivered one
+    std::atomic<uint64_t> mRequestedGeneration = kNoGeneration;
+    std::atomic<uint64_t> mSampledGeneration = kNoGeneration;
 
     std::mutex mSamplingMutex;
     std::unordered_map<wp<IBinder>, Descriptor, WpHash> mDescriptors GUARDED_BY(mSamplingMutex);

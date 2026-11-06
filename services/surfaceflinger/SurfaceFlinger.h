@@ -1436,6 +1436,9 @@ private:
     bool mLayersAdded = false;
 
     std::atomic_bool mMustComposite = false;
+    // Bumped by commits that changed layer or display state; region sampling skips frames that
+    // only recomposite unchanged content.
+    std::atomic<uint64_t> mContentGeneration = 0;
     std::atomic_bool mGeometryDirty = false;
 
     // constant members (no synchronization needed for access)

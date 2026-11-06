@@ -130,8 +130,14 @@ void RegionSamplingThread::addListener(const Rect& samplingArea, uint32_t stopLa
                                        const sp<IRegionSamplingListener>& listener) {
     sp<IBinder> asBinder = IInterface::asBinder(listener);
     asBinder->linkToDeath(sp<DeathRecipient>::fromExisting(this));
-    std::lock_guard lock(mSamplingMutex);
-    mDescriptors.emplace(wp<IBinder>(asBinder), Descriptor{samplingArea, stopLayerId, listener});
+    {
+        std::lock_guard lock(mSamplingMutex);
+        mDescriptors.emplace(wp<IBinder>(asBinder),
+                             Descriptor{samplingArea, stopLayerId, listener});
+        // A new listener needs a sample even if the content did not change
+        mSampledGeneration = kNoGeneration;
+    }
+    mFlinger.scheduleSample();
 }
 
 void RegionSamplingThread::removeListener(const sp<IRegionSamplingListener>& listener) {
@@ -163,25 +169,33 @@ void RegionSamplingThread::checkForStaleLuma() {
 
     if (mSampleRequestTime.has_value()) {
         SFTRACE_INT(lumaSamplingStepTag, static_cast<int>(samplingStep::waitForSamplePhase));
-        mSampleRequestTime.reset();
+        // Keep the request pending until doSample() accepts it, it may defer again
         mFlinger.scheduleSample();
     }
 }
 
 void RegionSamplingThread::onCompositionComplete(
-        std::optional<std::chrono::steady_clock::time_point> samplingDeadline) {
-    doSample(samplingDeadline);
+        std::optional<std::chrono::steady_clock::time_point> samplingDeadline,
+        uint64_t contentGeneration) {
+    doSample(samplingDeadline, contentGeneration);
 }
 
 void RegionSamplingThread::doSample(
-        std::optional<std::chrono::steady_clock::time_point> samplingDeadline) {
+        std::optional<std::chrono::steady_clock::time_point> samplingDeadline,
+        uint64_t contentGeneration) {
     std::lock_guard lock(mThreadControlMutex);
+    // Composites the display HAL requests without any content change, e.g. periodic
+    // refreshes on an idle screen, would return the same luma; skip the capture.
+    if (!mSampleRequestTime.has_value() && contentGeneration == mSampledGeneration) {
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (mLastSampleTime + mTunables.mSamplingPeriod > now) {
         // content changed, but we sampled not too long ago, so we need to sample some time in the
         // future.
         SFTRACE_INT(lumaSamplingStepTag, static_cast<int>(samplingStep::idleTimerWaiting));
-        mSampleRequestTime = now;
+        mSampleRequestTime = mSampleRequestTime.value_or(now);
+        mIdleTimer.reset();
         return;
     }
     if (!mSampleRequestTime.has_value() || now - *mSampleRequestTime < maxRegionSamplingDelay) {
@@ -191,6 +205,7 @@ void RegionSamplingThread::doSample(
         if (samplingDeadline.has_value() && now + mTunables.mSamplingDuration > *samplingDeadline) {
             SFTRACE_INT(lumaSamplingStepTag, static_cast<int>(samplingStep::waitForQuietFrame));
             mSampleRequestTime = mSampleRequestTime.value_or(now);
+            mIdleTimer.reset();
             return;
         }
     }
@@ -202,8 +217,18 @@ void RegionSamplingThread::doSample(
 
     mIdleTimer.reset();
 
+    mRequestedGeneration = contentGeneration;
     mSampleRequested = true;
     mCondition.notify_one();
+}
+
+// Keeps the request pending so the idle timer samples again
+void RegionSamplingThread::retryAfterFailedCapture() {
+    std::lock_guard lock(mThreadControlMutex);
+    if (!mSampleRequestTime.has_value()) {
+        mSampleRequestTime = std::chrono::steady_clock::now();
+    }
+    mIdleTimer.reset();
 }
 
 void RegionSamplingThread::binderDied(const wp<IBinder>& who) {
@@ -260,7 +285,7 @@ std::vector<float> RegionSamplingThread::sampleBuffer(
     return lumas;
 }
 
-void RegionSamplingThread::captureSample() {
+void RegionSamplingThread::captureSample(uint64_t contentGeneration) {
     SFTRACE_CALL();
     std::lock_guard lock(mSamplingMutex);
 
@@ -357,12 +382,17 @@ void RegionSamplingThread::captureSample() {
                            .debugName = "RegionSampling"};
 
     std::vector<std::pair<Layer*, sp<LayerFE>>> layers;
-    mFlinger.setScreenshotSnapshotsAndDisplayState(screenshotArgs,
-                                                   static_cast<ui::PixelFormat>(
-                                                           buffer->getPixelFormat()));
+    if (!mFlinger.setScreenshotSnapshotsAndDisplayState(screenshotArgs,
+                                                        static_cast<ui::PixelFormat>(
+                                                                buffer->getPixelFormat()))
+                 .has_value()) {
+        retryAfterFailedCapture();
+        return;
+    }
     FenceResult fenceResult = mFlinger.captureScreenshot(screenshotArgs, buffer, nullptr).get();
-    if (fenceResult.ok()) {
-        fenceResult.value()->waitForever(LOG_TAG);
+    if (!fenceResult.ok() || fenceResult.value()->waitForever(LOG_TAG) != OK) {
+        retryAfterFailedCapture();
+        return;
     }
 
     std::vector<Descriptor> activeDescriptors;
@@ -378,11 +408,17 @@ void RegionSamplingThread::captureSample() {
     if (lumas.size() != activeDescriptors.size()) {
         ALOGW("collected %zu median luma values for %zu descriptors", lumas.size(),
               activeDescriptors.size());
+        retryAfterFailedCapture();
         return;
     }
 
     for (size_t d = 0; d < activeDescriptors.size(); ++d) {
         activeDescriptors[d].listener->onSampleCollected(lumas[d]);
+    }
+    // Only a delivered sample counts. addListener() takes mSamplingMutex too, so its reset is
+    // not lost here.
+    if (!activeDescriptors.empty()) {
+        mSampledGeneration = contentGeneration;
     }
 
     mCachedBuffer = buffer;
@@ -395,8 +431,9 @@ void RegionSamplingThread::threadMain() NO_THREAD_SAFETY_ANALYSIS {
     while (mRunning) {
         if (mSampleRequested) {
             mSampleRequested = false;
+            const uint64_t contentGeneration = mRequestedGeneration;
             lock.unlock();
-            captureSample();
+            captureSample(contentGeneration);
             lock.lock();
         }
         mCondition.wait(lock, [this]() REQUIRES(mThreadControlMutex) {
