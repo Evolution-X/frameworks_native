@@ -1857,12 +1857,17 @@ void SurfaceFlinger::disableExpensiveRendering() {
     const char* const whence = __func__;
     auto future = mScheduler->schedule([=, this]() FTL_FAKE_GUARD(mStateLock) {
         SFTRACE_NAME(whence);
+        // A newer composite asked for it again and re-armed the expiry timer
+        if (mPowerAdvisor->isExpensiveRenderingHeld()) {
+            return;
+        }
         if (mPowerAdvisor->isUsingExpensiveRendering()) {
             for (const auto& [_, display] : mDisplays) {
                 constexpr bool kDisable = false;
                 mPowerAdvisor->setExpensiveRenderingExpected(display->getId(), kDisable);
             }
         }
+        mPowerAdvisor->expireExpensiveRendering();
     });
 
     future.wait();

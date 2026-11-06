@@ -64,6 +64,10 @@ public:
     virtual void onBootFinished() = 0;
     virtual void setExpensiveRenderingExpected(DisplayId displayId, bool expected) = 0;
     virtual bool isUsingExpensiveRendering() = 0;
+    // Whether a composite asked for EXPENSIVE_RENDERING too recently to switch it off
+    virtual bool isExpensiveRenderingHeld() { return false; }
+    // Drops every display's EXPENSIVE_RENDERING request, including removed displays
+    virtual void expireExpensiveRendering() {}
     // Checks both if it's supported and if it's enabled; this is thread-safe since its values are
     // set before onBootFinished, which gates all methods that run on threads other than SF main
     virtual bool usePowerHintSession() = 0;
@@ -157,6 +161,8 @@ public:
     void onBootFinished() override;
     void setExpensiveRenderingExpected(DisplayId displayId, bool expected) override;
     bool isUsingExpensiveRendering() override { return mNotifiedExpensiveRendering; };
+    bool isExpensiveRenderingHeld() override;
+    void expireExpensiveRendering() override;
     bool usePowerHintSession() override;
     bool supportsPowerHintSession() override;
     bool supportsGpuReporting() override;
@@ -208,6 +214,10 @@ private:
     std::atomic_bool mSendUpdateImminent = true;
     std::atomic<nsecs_t> mLastScreenUpdatedTime = 0;
     std::optional<scheduler::OneShotTimer> mScreenUpdateTimer;
+    // Last composite that asked for EXPENSIVE_RENDERING, and how long it stays on after it
+    std::atomic<nsecs_t> mLastExpensiveRenderingTime = 0;
+    static constexpr std::chrono::milliseconds kExpensiveRenderingHold{400};
+    std::optional<scheduler::OneShotTimer> mExpensiveRenderingTimer;
 
     // Higher-level timing data used for estimation
     struct DisplayTimeline {

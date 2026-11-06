@@ -73,8 +73,7 @@ PowerAdvisor::PowerAdvisor(std::function<void()>&& sfDisableExpensiveFn,
         mScreenUpdateTimer.emplace("UpdateImminentTimer", timeout,
                                    /* resetCallback */ nullptr,
                                    /* timeoutCallback */
-                                   [this, disableExpensiveFn = std::move(sfDisableExpensiveFn),
-                                    timeout] {
+                                   [this, timeout] {
                                        while (true) {
                                            auto timeSinceLastUpdate = std::chrono::nanoseconds(
                                                    systemTime() - mLastScreenUpdatedTime.load());
@@ -89,9 +88,14 @@ PowerAdvisor::PowerAdvisor(std::function<void()>&& sfDisableExpensiveFn,
                                                                        timeSinceLastUpdate);
                                        }
                                        mSendUpdateImminent.store(true);
-                                       disableExpensiveFn();
                                    });
     }
+    // EXPENSIVE_RENDERING stays on until kExpensiveRenderingHold after the last composite that
+    // asked for it, so isolated composites a few hundred ms apart do not switch it on and off
+    // every time.
+    mExpensiveRenderingTimer.emplace("ExpensiveRenderingTimer", kExpensiveRenderingHold,
+                                     /* resetCallback */ nullptr,
+                                     /* timeoutCallback */ std::move(sfDisableExpensiveFn));
 }
 
 void PowerAdvisor::init() {
@@ -99,6 +103,32 @@ void PowerAdvisor::init() {
     if (mScreenUpdateTimer) {
         mScreenUpdateTimer->start();
     }
+    if (mExpensiveRenderingTimer) {
+        mExpensiveRenderingTimer->start();
+    }
+}
+
+void PowerAdvisor::expireExpensiveRendering() {
+    mExpensiveDisplays.clear();
+    if (mNotifiedExpensiveRendering && mHasExpensiveRendering) {
+        auto ret = getPowerHal().setMode(hal::Mode::EXPENSIVE_RENDERING, false);
+        if (!ret.isOk()) {
+            if (ret.isUnsupported()) {
+                mHasExpensiveRendering = false;
+            } else if (mExpensiveRenderingTimer) {
+                // Try again later, nothing else would switch it off
+                mExpensiveRenderingTimer->reset();
+            }
+            return;
+        }
+        mNotifiedExpensiveRendering = false;
+        traceExpensiveRendering(mNotifiedExpensiveRendering);
+    }
+}
+
+bool PowerAdvisor::isExpensiveRenderingHeld() {
+    return std::chrono::nanoseconds(systemTime() - mLastExpensiveRenderingTime.load()) <
+            kExpensiveRenderingHold;
 }
 
 void PowerAdvisor::onBootFinished() {
@@ -115,12 +145,20 @@ void PowerAdvisor::setExpensiveRenderingExpected(DisplayId displayId, bool expec
         return;
     }
     if (expected) {
+        mLastExpensiveRenderingTime.store(systemTime());
+        if (mExpensiveRenderingTimer) {
+            mExpensiveRenderingTimer->reset();
+        }
         mExpensiveDisplays.insert(displayId);
     } else {
         mExpensiveDisplays.erase(displayId);
     }
 
     const bool expectsExpensiveRendering = !mExpensiveDisplays.empty();
+    if (!expectsExpensiveRendering && isExpensiveRenderingHeld()) {
+        // The expiry timer switches it off once the hold has passed
+        return;
+    }
     if (mNotifiedExpensiveRendering != expectsExpensiveRendering) {
         auto ret = getPowerHal().setMode(hal::Mode::EXPENSIVE_RENDERING, expectsExpensiveRendering);
         if (!ret.isOk()) {
