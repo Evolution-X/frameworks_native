@@ -433,7 +433,16 @@ using PackageLockGuard = std::lock_guard<PackageLock>;
 
 static constexpr size_t kTarBlock = 512;
 
-static void tarPutOctal(char* field, size_t len, uint64_t value) {
+static void tarPutNumber(char* field, size_t len, uint64_t value) {
+    if (len == 12 && value >= (uint64_t{1} << 33)) {
+        memset(field, 0, len);
+        for (size_t i = len - 1; i > 0; --i) {
+            field[i] = static_cast<char>(value & 0xff);
+            value >>= 8;
+        }
+        field[0] = static_cast<char>(0x80);
+        return;
+    }
     snprintf(field, len, "%0*llo", static_cast<int>(len - 1),
              static_cast<unsigned long long>(value));
 }
@@ -473,11 +482,11 @@ static bool tarWriteHeader(int fd, const std::string& path, uint64_t size, char 
     }
     if (!prefix.empty()) memcpy(hdr + 345, prefix.c_str(), prefix.size());
 
-    tarPutOctal(hdr + 100, 8, type == '5' ? 0755 : 0644);
-    tarPutOctal(hdr + 108, 8, 0);
-    tarPutOctal(hdr + 116, 8, 0);
-    tarPutOctal(hdr + 124, 12, size);
-    tarPutOctal(hdr + 136, 12, static_cast<uint64_t>(mtime));
+    tarPutNumber(hdr + 100, 8, type == '5' ? 0755 : 0644);
+    tarPutNumber(hdr + 108, 8, 0);
+    tarPutNumber(hdr + 116, 8, 0);
+    tarPutNumber(hdr + 124, 12, size);
+    tarPutNumber(hdr + 136, 12, static_cast<uint64_t>(mtime));
     hdr[156] = type;
     memcpy(hdr + 257, "ustar", 5);
     memcpy(hdr + 263, "00", 2);
@@ -485,13 +494,13 @@ static bool tarWriteHeader(int fd, const std::string& path, uint64_t size, char 
     memset(hdr + 148, ' ', 8);
     unsigned int sum = 0;
     for (size_t i = 0; i < kTarBlock; i++) sum += static_cast<unsigned char>(hdr[i]);
-    tarPutOctal(hdr + 148, 8, sum);
+    tarPutNumber(hdr + 148, 8, sum);
 
     return android::base::WriteFully(fd, hdr, kTarBlock);
 }
 
-static constexpr uint64_t kTarMaxFileSize  = (uint64_t)4  * 1024 * 1024 * 1024;
-static constexpr uint64_t kTarMaxTotalSize = (uint64_t)8  * 1024 * 1024 * 1024;
+static constexpr uint64_t kTarMaxFileSize  = uint64_t{1} << 40;
+static constexpr uint64_t kTarMaxTotalSize = uint64_t{1} << 40;
 static constexpr uint32_t kTarMaxEntries   = 100000;
 
 static int tarTree(int fd, const std::string& path, const std::string& rel,
@@ -549,6 +558,7 @@ static int tarTree(int fd, const std::string& path, const std::string& rel,
                 return -err;
             }
             const uint64_t size = static_cast<uint64_t>(sb.st_size);
+            if (size > kTarMaxFileSize) return -EFBIG;
             if (!tarWriteHeader(fd, childRel, size, '0', sb.st_mtime)) {
                 LOG(WARNING) << "tarAppData: failed to write file header for " << childRel;
                 continue;
@@ -2437,15 +2447,29 @@ binder::Status InstalldNativeService::tarAppData(const std::optional<std::string
 }
 
 
-static uint64_t tarReadOctal(const char* field, size_t len) {
-    static const uint64_t kOctalOverflowSentinel = UINT64_MAX;
+static uint64_t tarReadNumber(const char* field, size_t len) {
+    if (len == 0) return UINT64_MAX;
     uint64_t val = 0;
+    const auto first = static_cast<unsigned char>(field[0]);
+    if ((first & 0x80) != 0) {
+        if ((first & 0x40) != 0) return UINT64_MAX;
+        val = first & 0x3f;
+        for (size_t i = 1; i < len; ++i) {
+            const auto digit = static_cast<unsigned char>(field[i]);
+            if (val > (UINT64_MAX - digit) / 256) return UINT64_MAX;
+            val = val * 256 + digit;
+        }
+        return val;
+    }
     size_t i = 0;
     while (i < len && (field[i] == ' ' || field[i] == '\0')) i++;
     for (; i < len && field[i] >= '0' && field[i] <= '7'; i++) {
         const uint64_t digit = field[i] - '0';
-        if (val > (UINT64_MAX - digit) / 8) return kOctalOverflowSentinel;
+        if (val > (UINT64_MAX - digit) / 8) return UINT64_MAX;
         val = val * 8 + digit;
+    }
+    for (; i < len; ++i) {
+        if (field[i] != ' ' && field[i] != '\0') return UINT64_MAX;
     }
     return val;
 }
@@ -2477,7 +2501,7 @@ static bool tarValidateHeader(const char hdr[512], std::string* outPath) {
         LOG(WARNING) << "tarRestore: invalid ustar magic/version in tar header";
         return false;
     }
-    unsigned int stored = (unsigned int)tarReadOctal(hdr + 148, 8);
+    unsigned int stored = (unsigned int)tarReadNumber(hdr + 148, 8);
     unsigned int computed = 0;
     for (int i = 0; i < 512; i++) {
         computed += (i >= 148 && i < 156)
@@ -2565,9 +2589,9 @@ binder::Status InstalldNativeService::untarAppDataExternal(
                     kTarMaxEntries));
         }
 
-        const uint64_t size = tarReadOctal(hdr + 124, 12);
-        if (size == UINT64_MAX) {
-            return error("untarAppDataExternal: octal overflow in size field");
+        const uint64_t size = tarReadNumber(hdr + 124, 12);
+        if (size == UINT64_MAX || size > kTarMaxFileSize) {
+            return error("untarAppDataExternal: invalid tar size field");
         }
         const uint64_t padded = (size + kTarBlock - 1) & ~((uint64_t)kTarBlock - 1);
 
@@ -2576,12 +2600,6 @@ binder::Status InstalldNativeService::untarAppDataExternal(
 
         std::string clean;
         if (!tarSanitizeName(rawPath.c_str(), rawPath.size(), &clean)) {
-            DRAIN_OR_FAIL("untarAppDataExternal");
-            continue;
-        }
-        if (size > kTarMaxFileSize) {
-            LOG(WARNING) << "untarAppDataExternal: skipping oversized entry " << clean
-                         << " (" << size << " bytes)";
             DRAIN_OR_FAIL("untarAppDataExternal");
             continue;
         }
@@ -2766,9 +2784,9 @@ binder::Status InstalldNativeService::untarAppData(
                     kTarMaxEntries));
         }
 
-        const uint64_t size = tarReadOctal(hdr + 124, 12);
-        if (size == UINT64_MAX) {
-            return error("untarAppData: octal overflow in size field");
+        const uint64_t size = tarReadNumber(hdr + 124, 12);
+        if (size == UINT64_MAX || size > kTarMaxFileSize) {
+            return error("untarAppData: invalid tar size field");
         }
         const uint64_t padded = (size + kTarBlock - 1) & ~((uint64_t)kTarBlock - 1);
 
@@ -2777,12 +2795,6 @@ binder::Status InstalldNativeService::untarAppData(
 
         std::string clean;
         if (!tarSanitizeName(rawPath.c_str(), rawPath.size(), &clean)) {
-            DRAIN_OR_FAIL("untarAppData");
-            continue;
-        }
-        if (size > kTarMaxFileSize) {
-            LOG(WARNING) << "untarAppData: skipping oversized entry " << clean
-                         << " (" << size << " bytes)";
             DRAIN_OR_FAIL("untarAppData");
             continue;
         }
