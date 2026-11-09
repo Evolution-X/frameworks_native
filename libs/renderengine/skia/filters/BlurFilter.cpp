@@ -563,7 +563,13 @@ static float cosRimRatio(float w, float h, float radius) {
     const float corner = std::min(radius, shortSide / 2);
     const float side = (w * h - shortSide * shortSide) / (2 * shortSide);
     float pos = w >= h ? side + h / 2 : h / 2 - side;
-    if (!(w == h && radius >= h / 2)) pos -= corner / 2;
+    // A circle skips the corner offset. Ease it in as the shape stretches instead of applying it
+    // whole a pixel off square, or a moving circle's flare jumps as its bounds round.
+    const float longSide = std::max(w, h);
+    const float stretch = radius >= shortSide / 2
+            ? std::clamp((longSide - shortSide) / (shortSide * 0.25f), 0.0f, 1.0f)
+            : 1.0f;
+    pos -= corner / 2 * stretch;
     return pos * 0.5f / (w + h) + 0.5f;
 }
 
