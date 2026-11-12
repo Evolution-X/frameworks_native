@@ -934,6 +934,8 @@ void chooseRenderEngineType(renderengine::RenderEngineCreationArgs::Builder& bui
 /**
  * Choose a suggested blurring algorithm if supportsBlur is true. By default Kawase will be
  * suggested as it's faster than a full Gaussian blur and looks close enough.
+ * A low end device, which sets ro.evolution.glass_low_end or has little RAM, gets KawaseDarkmoon
+ * by default, as it is lighter on the GPU.
  */
 renderengine::RenderEngine::BlurAlgorithm chooseBlurAlgorithm(bool supportsBlur) {
     if (!supportsBlur) {
@@ -946,6 +948,12 @@ renderengine::RenderEngine::BlurAlgorithm chooseBlurAlgorithm(bool supportsBlur)
     } else if (algorithm == "kawase") {
         return renderengine::RenderEngine::BlurAlgorithm::Kawase;
     } else if (algorithm == "kawase_darkmoon") {
+        return renderengine::RenderEngine::BlurAlgorithm::KawaseDarkmoon;
+    } else if (algorithm.empty() &&
+               base::GetBoolProperty("ro.evolution.glass_low_end"s,
+                                     base::GetBoolProperty("ro.config.low_ram"s, false))) {
+        // KawaseDarkmoon is the lighter filter, made for weak GPUs, so a device that holds the
+        // glass back, or has little RAM, uses it unless it sets an algorithm of its own.
         return renderengine::RenderEngine::BlurAlgorithm::KawaseDarkmoon;
     } else {
         return renderengine::RenderEngine::BlurAlgorithm::KawaseDualFilterV2;
