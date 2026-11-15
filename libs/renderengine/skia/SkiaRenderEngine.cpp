@@ -84,6 +84,7 @@
 #include "ShaderCache.h"
 #include "compat/SkiaGpuContext.h"
 #include "filters/BlurFilter.h"
+#include "filters/DolbyVisionShader.h"
 #include "filters/GainmapFactory.h"
 #include "filters/GaussianBlurFilter.h"
 #include "filters/KawaseBlurDualFilterV2.h"
@@ -673,7 +674,22 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         }
     }
 
-    if (parameters.requiresLinearEffect) {
+    // Dolby Vision frames need the vendor reshaping, which replaces the linear effect.
+    bool usedDolbyVision = false;
+    if (graphicBuffer && !usedAgtm && !parameters.layer.luts) {
+        if (auto dolbyShader = DolbyVisionShader::getInstance().create(shader, parameters.layer,
+                                                                       parameters.display,
+                                                                       graphicBuffer,
+                                                                       parameters.outputDataSpace,
+                                                                       parameters.layerDimmingRatio,
+                                                                       isVulkan(),
+                                                                       parameters.colorSpaceOptions)) {
+            shader = std::move(dolbyShader);
+            usedDolbyVision = true;
+        }
+    }
+
+    if (parameters.requiresLinearEffect && !usedDolbyVision) {
         const auto format = targetBuffer != nullptr
                 ? std::optional<ui::PixelFormat>(
                           static_cast<ui::PixelFormat>(targetBuffer->getPixelFormat()))

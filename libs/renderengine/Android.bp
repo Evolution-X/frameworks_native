@@ -109,6 +109,7 @@ filegroup {
         "skia/debug/SkiaCapture.cpp",
         "skia/debug/SkiaMemoryReporter.cpp",
         "skia/filters/BlurFilter.cpp",
+        "skia/filters/DolbyVisionShader.cpp",
         "skia/filters/EdgeExtensionShaderFactory.cpp",
         "skia/filters/GainmapFactory.cpp",
         "skia/filters/GaussianBlurFilter.cpp",

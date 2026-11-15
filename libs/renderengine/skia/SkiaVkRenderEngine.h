@@ -30,6 +30,7 @@ public:
     ~SkiaVkRenderEngine() override;
 
     int getContextPriority() override;
+    bool isVulkan() const override { return true; }
 
     class DestroySemaphoreInfo {
     public:

@@ -182,6 +182,7 @@ protected:
 
 private:
     virtual SkiaBackend backend() const = 0;
+    virtual bool isVulkan() const { return false; }
 
     void mapExternalTextureBuffer(const sp<GraphicBuffer>& buffer,
                                   bool isRenderable) override final;
