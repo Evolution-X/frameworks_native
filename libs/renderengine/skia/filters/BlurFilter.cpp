@@ -636,7 +636,13 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
         glass.uniform("color1") = layers.colors[1];
         glass.uniform("color2") = layers.colors[2];
         glass.uniform("color3") = layers.colors[3];
+        // With Liquid Glass, the dark notification card is a denser, more colourful frost than
+        // the other COS glass, as iOS draws its notifications, so white text stays readable
+        // over a bright wallpaper.
         glass.uniform("lift") = material == 11 ? SkV4{1.0f, 0.0f, 1.0f, 0.0f}
+                : material == 7 && mLiquidGlass
+                ? SkV4{tune("card_gain", 0.6f), tune("card_add", 0.0f), tune("card_sat", 1.5f),
+                       0.0f}
                 : SkV4{tune("cos_gain", 1.0f), tune("cos_add", 0.0f),
                        tune("cos_sat", 1.0f), 0.0f};
         const SkRect& rect = effectRegion.rect();
